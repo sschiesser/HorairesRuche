@@ -4,7 +4,10 @@
       "Bash(pip install *)",
       "Bash(python -c ' *)",
       "Bash(python generate_sample_data.py)",
-      "Bash(python generate_planning.py)"
+      "Bash(python generate_planning.py)",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(where python *)",
+      "PowerShell(python -m pip show pandas)"
     ]
   }
 }

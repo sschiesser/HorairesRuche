@@ -1,3 +1,4 @@
+
 """
 Génère le planning hebdomadaire d'une équipe (60-80 personnes, 2 shifts/jour)
 à partir de 3 fichiers Excel saisis par le planificateur, et produit un
@@ -23,15 +24,26 @@ Fichiers d'entrée attendus dans data/ :
       -> une ligne par plage horaire que la personne ne souhaite pas
          travailler. Priorité 1 = blocage absolu (jamais affecté sur ce
          créneau). Priorité 2 = préférence (évité si possible, mais peut
-         être utilisé pour compléter le planning).
+         être utilisé pour compléter le planning). Chaque personne a droit
+         à au maximum 2 blocages par jour.
+
+  shifts_fixes.xlsx (optionnel)
+      Nom | Jour | Tâche | Début | Fin
+      -> une ligne par shift déjà imposé pour toute la semaine à certaines
+         personnes (typiquement 1 ou 2 par personne concernée). La ligne
+         doit correspondre exactement à un créneau de plages_horaires.xlsx
+         (même Jour/Tâche/Début/Fin). Ce shift est garanti dans le planning,
+         même s'il dépasse les capacités ou un blocage de la personne.
 
 Règles appliquées :
   - une personne n'est jamais affectée à une tâche pour laquelle elle n'a
-    pas la capacité requise ;
+    pas la capacité requise (sauf shift fixe) ;
   - une personne n'est jamais affectée sur un créneau couvert par un
-    blocage de priorité 1 ;
+    blocage de priorité 1 (sauf shift fixe) ;
   - une personne fait au maximum 2 shifts par jour, et ne peut pas être
     affectée à deux créneaux qui se chevauchent le même jour ;
+  - les shifts fixes sont toujours attribués et comptent dans le quota de
+    2 shifts/jour ;
   - le solveur essaie de couvrir tous les besoins (Nb_personnes), d'éviter
     les créneaux en priorité 2, de tendre vers 2 shifts/jour par personne
     et de répartir la charge équitablement sur la semaine.
@@ -87,6 +99,8 @@ def to_minutes(value) -> int:
 
 
 def minutes_to_str(minutes: int) -> str:
+    if minutes != 0 and minutes % (24 * 60) == 0:
+        return "24:00"
     minutes = minutes % (24 * 60)
     return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
@@ -154,23 +168,62 @@ def load_data():
             "priorite": int(row["Priorité"]),
         })
 
-    return shifts, people, blocages_map
+    for (nom, jour), blocks in blocages_map.items():
+        if len(blocks) > 2:
+            print(f"Attention : {nom} a {len(blocks)} blocages déclarés le {jour} (maximum recommandé : 2).")
+
+    # Shifts fixes (optionnel) : créneaux déjà imposés pour toute la semaine
+    shift_lookup = {
+        (s["jour"], s["tache_norm"], s["debut"], s["fin"]): s_idx
+        for s_idx, s in enumerate(shifts)
+    }
+
+    fixed_assignments = []
+    fixed_path = DATA_DIR / "shifts_fixes.xlsx"
+    if fixed_path.exists():
+        fixed_df = pd.read_excel(fixed_path).dropna(subset=["Nom", "Jour", "Tâche", "Début", "Fin"])
+        for _, row in fixed_df.iterrows():
+            nom = str(row["Nom"]).strip()
+            jour = str(row["Jour"]).strip()
+            tache_norm = str(row["Tâche"]).strip().lower()
+            debut = to_minutes(row["Début"])
+            fin = to_minutes(row["Fin"])
+            if fin <= debut:
+                fin += 24 * 60
+            key = (jour, tache_norm, debut, fin)
+            if key not in shift_lookup:
+                raise ValueError(
+                    f"shifts_fixes.xlsx : créneau introuvable dans plages_horaires.xlsx pour "
+                    f"{nom} ({jour}, {row['Tâche']}, {minutes_to_str(debut)}-{minutes_to_str(fin)})"
+                )
+            fixed_assignments.append((nom, shift_lookup[key]))
+
+    return shifts, people, blocages_map, fixed_assignments
 
 
 # ---------------------------------------------------------------------------
 # Construction et résolution du modèle
 # ---------------------------------------------------------------------------
 
-def build_model(shifts, people, blocages_map):
+def build_model(shifts, people, blocages_map, fixed_assignments):
     model = cp_model.CpModel()
+
+    name_to_idx = {p["nom"]: idx for idx, p in enumerate(people)}
+    fixed_pairs = set()
+    for nom, s_idx in fixed_assignments:
+        if nom not in name_to_idx:
+            raise ValueError(f"shifts_fixes.xlsx : personne inconnue '{nom}' (absente de personnes.xlsx)")
+        fixed_pairs.add((name_to_idx[nom], s_idx))
 
     x = {}          # (p_idx, s_idx) -> BoolVar, uniquement pour les paires possibles
     p2_pairs = set()  # paires en conflit avec une préférence (priorité 2)
 
     for s_idx, s in enumerate(shifts):
         for p_idx, p in enumerate(people):
+            is_fixed = (p_idx, s_idx) in fixed_pairs
+
             caps = p["capacites"]
-            if caps is not None and s["tache_norm"] not in caps:
+            if not is_fixed and caps is not None and s["tache_norm"] not in caps:
                 continue
 
             blocks = blocages_map.get((p["nom"], s["jour"]), [])
@@ -178,7 +231,7 @@ def build_model(shifts, people, blocages_map):
                 b["priorite"] == 1 and overlaps(s["debut"], s["fin"], b["debut"], b["fin"])
                 for b in blocks
             )
-            if hard_blocked:
+            if hard_blocked and not is_fixed:
                 continue
 
             x[(p_idx, s_idx)] = model.new_bool_var(f"x_{p_idx}_{s_idx}")
@@ -188,6 +241,10 @@ def build_model(shifts, people, blocages_map):
                 for b in blocks
             ):
                 p2_pairs.add((p_idx, s_idx))
+
+    # Les shifts fixes sont garantis
+    for pair in fixed_pairs:
+        model.add(x[pair] == 1)
 
     # Couverture des besoins : assignés + manquants == requis
     shortfall = {}
@@ -370,10 +427,11 @@ def export_results(shifts, people, x, shortfall, p2_pairs, solver, output_path):
 # ---------------------------------------------------------------------------
 
 def main():
-    shifts, people, blocages_map = load_data()
-    print(f"{len(shifts)} créneaux à couvrir, {len(people)} personnes dans l'équipe.")
+    shifts, people, blocages_map, fixed_assignments = load_data()
+    print(f"{len(shifts)} créneaux à couvrir, {len(people)} personnes dans l'équipe, "
+          f"{len(fixed_assignments)} shift(s) fixe(s).")
 
-    model, x, shortfall, p2_pairs = build_model(shifts, people, blocages_map)
+    model, x, shortfall, p2_pairs = build_model(shifts, people, blocages_map, fixed_assignments)
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = SOLVER_TIME_LIMIT_SECONDS
@@ -382,7 +440,9 @@ def main():
 
     print(f"Statut du solveur : {solver.status_name(status)}")
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        print("Aucune solution trouvée.")
+        print("Aucune solution trouvée. Vérifiez notamment les shifts fixes : "
+              "deux shifts fixes qui se chevauchent, ou plus de 2 shifts fixes "
+              "le même jour pour une même personne, rendent le planning impossible.")
         return
 
     total_shortfall = sum(solver.value(v) for v in shortfall.values())
