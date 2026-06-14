@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(python -c ' *)",
+      "Bash(python generate_sample_data.py)",
+      "Bash(python generate_planning.py)"
+    ]
+  }
+}
