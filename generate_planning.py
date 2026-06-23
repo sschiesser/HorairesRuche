@@ -138,8 +138,12 @@ def person_key(nom, prenom) -> tuple:
 # Sélection du jour
 # ---------------------------------------------------------------------------
 
+JOURS_VALIDES = {"lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"}
+
+
 def lister_jours_disponibles():
-    return list(pd.read_excel(DATA_DIR / "plages_horaires.xlsx", sheet_name=None).keys())
+    onglets = pd.read_excel(DATA_DIR / "plages_horaires.xlsx", sheet_name=None).keys()
+    return [o for o in onglets if o.strip().lower() in JOURS_VALIDES]
 
 
 def demander_jour(jours_disponibles):
