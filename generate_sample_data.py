@@ -4,7 +4,8 @@ Génère des fichiers Excel d'exemple dans le dossier data/ :
   - personnes.xlsx       : l'équipe et ses capacités générales
   - blocages.xlsx        : les indisponibilités déclarées par chacun (priorité 1 ou 2),
                             un onglet par jour
-  - shifts_fixes.xlsx    : les shifts déjà imposés à certaines personnes
+  - shifts_fixes.xlsx    : les shifts déjà imposés à certaines personnes,
+                            un onglet par jour
 
 Il n'y a pas de "périodes" fixes communes à tous les jours : une même tâche
 peut avoir plusieurs créneaux dans la journée (ex: Accueil 13h-15h puis
@@ -83,13 +84,22 @@ with pd.ExcelWriter(DATA_DIR / "plages_horaires.xlsx") as writer:
 
 # --- 2. Personnes -----------------------------------------------------------
 TACHES_LISTE = list(TACHES.keys())
+FONCTIONS = ["Staff", "Adjoint.e", "Junior.e", "COF"]
+FONCTIONS_POIDS = [0.78, 0.10, 0.08, 0.04]
+
 personnes_rows = []
 for i in range(1, 71):
     nb_caps = random.randint(2, 4)
     caps = random.sample(TACHES_LISTE, nb_caps)
     # ~10% de personnes "polyvalentes", capables de toutes les tâches
     capacites = "Tous" if random.random() < 0.1 else ", ".join(caps)
-    personnes_rows.append({"Nom": f"Nom{i:02d}", "Prénom": f"Prenom{i:02d}", "Capacités": capacites})
+    fonction = random.choices(FONCTIONS, weights=FONCTIONS_POIDS)[0]
+    personnes_rows.append({
+        "Nom": f"Nom{i:02d}",
+        "Prénom": f"Prenom{i:02d}",
+        "Fonction": fonction,
+        "Capacités": capacites,
+    })
 
 pd.DataFrame(personnes_rows).to_excel(DATA_DIR / "personnes.xlsx", index=False)
 
@@ -131,11 +141,13 @@ p1 = trouver_plage("Lundi", "Technique", occurrence=1)    # créneau du soir
 p2a = trouver_plage("Mardi", "Sécurité", occurrence=0)     # créneau de midi
 p2b = trouver_plage("Vendredi", "Sécurité", occurrence=1)  # créneau du soir
 
-shifts_fixes_rows = [
-    {"Nom": "Nom01", "Prénom": "Prenom01", "Jour": "Lundi", "Tâche": p1["Tâche"], "Début": p1["Début"], "Fin": p1["Fin"]},
-    {"Nom": "Nom02", "Prénom": "Prenom02", "Jour": "Mardi", "Tâche": p2a["Tâche"], "Début": p2a["Début"], "Fin": p2a["Fin"]},
-    {"Nom": "Nom02", "Prénom": "Prenom02", "Jour": "Vendredi", "Tâche": p2b["Tâche"], "Début": p2b["Début"], "Fin": p2b["Fin"]},
-]
-pd.DataFrame(shifts_fixes_rows).to_excel(DATA_DIR / "shifts_fixes.xlsx", index=False)
+shifts_fixes_par_jour = {
+    "Lundi": [{"Nom": "Nom01", "Prénom": "Prenom01", "Tâche": p1["Tâche"], "Début": p1["Début"], "Fin": p1["Fin"]}],
+    "Mardi": [{"Nom": "Nom02", "Prénom": "Prenom02", "Tâche": p2a["Tâche"], "Début": p2a["Début"], "Fin": p2a["Fin"]}],
+    "Vendredi": [{"Nom": "Nom02", "Prénom": "Prenom02", "Tâche": p2b["Tâche"], "Début": p2b["Début"], "Fin": p2b["Fin"]}],
+}
+with pd.ExcelWriter(DATA_DIR / "shifts_fixes.xlsx") as writer:
+    for jour, rows in shifts_fixes_par_jour.items():
+        pd.DataFrame(rows).to_excel(writer, sheet_name=jour, index=False)
 
 print(f"Fichiers d'exemple générés dans {DATA_DIR}")

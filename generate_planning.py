@@ -12,13 +12,15 @@ Fichiers d'entrée attendus dans data/ :
          et le nombre de personnes nécessaires sur ce créneau).
 
   personnes.xlsx
-      Nom | Prénom | Capacités
+      Nom | Prénom | Fonction | Capacités
       -> une ligne par membre de l'équipe. "Nom" et "Prénom" identifient la
          personne (plusieurs personnes peuvent partager le même nom de
-         famille). "Capacités" liste les tâches que la personne peut
-         effectuer, séparées par des virgules (ex: "Bar, Accueil"). Laisser
-         vide ou écrire "Tous" si la personne peut effectuer n'importe
-         quelle tâche.
+         famille). "Fonction" détermine le nombre maximum de shifts par
+         jour pour cette personne : "Junior.e" -> 1, "Staff"/"Adjoint.e"
+         -> 2, "COF" -> 0 (jamais affecté, sauf shift fixe). "Capacités"
+         liste les tâches que la personne peut effectuer, séparées par des
+         virgules (ex: "Bar, Accueil"). Laisser vide ou écrire "Tous" si la
+         personne peut effectuer n'importe quelle tâche.
 
   blocages.xlsx
       Un onglet par jour (comme plages_horaires.xlsx). Chaque onglet
@@ -33,23 +35,31 @@ Fichiers d'entrée attendus dans data/ :
          jour. Un jour sans aucun blocage peut ne pas avoir d'onglet.
 
   shifts_fixes.xlsx (optionnel)
-      Nom | Prénom | Jour | Tâche | Début | Fin
-      -> une ligne par shift déjà imposé à certaines personnes. Nom +
-         Prénom doivent correspondre exactement à une ligne de
-         personnes.xlsx, et Jour/Tâche/Début/Fin doivent correspondre
-         exactement à un créneau de l'onglet planifié. Ce shift est garanti
+      Un onglet par jour (comme plages_horaires.xlsx). Chaque onglet
+      contient :
+      Nom | Prénom | Tâche | Début | Fin
+      -> une ligne par shift déjà imposé à certaines personnes ce jour-là.
+         Nom + Prénom doivent correspondre exactement à une ligne de
+         personnes.xlsx. Ce créneau vient s'ajouter à ceux de
+         plages_horaires.xlsx : il n'a pas besoin de correspondre à un
+         créneau existant (Tâche/Début/Fin libres). Ce shift est garanti
          dans le planning, même s'il dépasse les capacités ou un blocage de
-         la personne.
+         la personne. Un jour sans aucun shift fixe peut ne pas avoir
+         d'onglet.
 
 Règles appliquées :
   - une personne n'est jamais affectée à une tâche pour laquelle elle n'a
     pas la capacité requise (sauf shift fixe) ;
   - une personne n'est jamais affectée sur un créneau couvert par un
     blocage de priorité 1 (sauf shift fixe) ;
-  - une personne fait au maximum 2 shifts dans la journée, et ne peut pas
-    être affectée à deux créneaux qui se chevauchent ;
+  - une personne fait au maximum 2 shifts dans la journée (1 pour un
+    Junior.e, 0 pour un COF, selon la Fonction), et ne peut pas être
+    affectée à deux créneaux qui se chevauchent ou qui laissent moins de
+    2h de pause entre eux ;
+  - un Junior.e n'est jamais affecté à un créneau qui se termine après
+    23:00 (sauf shift fixe) ;
   - les shifts fixes sont toujours attribués et comptent dans le quota de
-    2 shifts/jour ;
+    shifts par jour ;
   - couvrir tous les besoins en personnel (Nb_personnes) est la priorité
     absolue du solveur ; à couverture égale seulement, il essaie d'éviter
     les créneaux en priorité 2, puis de répartir la charge équitablement
@@ -85,6 +95,17 @@ W_FAIRNESS = 1       # répartir la charge de travail équitablement
 
 TARGET_SHIFTS_PER_DAY = 2
 SOLVER_TIME_LIMIT_SECONDS = 30
+PAUSE_MINIMALE_MINUTES = 120  # pause minimale entre deux shifts d'une même personne
+HEURE_LIMITE_JUNIOR_MINUTES = 23 * 60  # un Junior.e ne termine jamais après 23:00
+
+# Nombre maximum de shifts par jour selon la "Fonction" (personnes.xlsx).
+# Une Fonction non reconnue utilise TARGET_SHIFTS_PER_DAY par défaut.
+MAX_SHIFTS_PAR_FONCTION = {
+    "junior.e": 1,
+    "staff": 2,
+    "adjoint.e": 2,
+    "cof": 0,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +137,15 @@ def minutes_to_str(minutes: int) -> str:
 
 def overlaps(start1: int, end1: int, start2: int, end2: int) -> bool:
     return start1 < end2 and start2 < end1
+
+
+def gap_insuffisant(s1, s2, pause_minimale: int) -> bool:
+    """True si les deux créneaux se chevauchent, ou s'ils laissent moins de
+    pause_minimale minutes de battement entre la fin de l'un et le début de l'autre."""
+    if overlaps(s1["debut"], s1["fin"], s2["debut"], s2["fin"]):
+        return True
+    gap = s2["debut"] - s1["fin"] if s1["fin"] <= s2["debut"] else s1["debut"] - s2["fin"]
+    return gap < pause_minimale
 
 
 def parse_capacites(value):
@@ -199,11 +229,14 @@ def load_data(jour):
     for _, row in personnes_df.iterrows():
         nom = str(row["Nom"]).strip()
         prenom = str(row["Prénom"]).strip()
+        fonction = str(row.get("Fonction", "")).strip()
         people.append({
             "nom": nom,
             "prenom": prenom,
             "nom_complet": f"{prenom} {nom}".strip(),
             "key": person_key(nom, prenom),
+            "fonction": fonction.lower(),
+            "max_shifts": MAX_SHIFTS_PAR_FONCTION.get(fonction.lower(), TARGET_SHIFTS_PER_DAY),
             "capacites": parse_capacites(row.get("Capacités")),
         })
 
@@ -239,19 +272,20 @@ def load_data(jour):
             nom_complet = people[key_to_idx[key]]["nom_complet"]
             print(f"Attention : {nom_complet} a {len(blocks)} blocages déclarés le {jour} (maximum recommandé : 2).")
 
-    # Shifts fixes (optionnel) : créneaux déjà imposés ce jour-là
-    shift_lookup = {
-        (s["tache_norm"], s["debut"], s["fin"]): s_idx
-        for s_idx, s in enumerate(shifts)
-    }
-
+    # Shifts fixes (optionnel) : créneaux déjà imposés ce jour-là, ajoutés en
+    # plus de ceux de plages_horaires.xlsx (pas besoin d'y correspondre).
     fixed_assignments = []
     fixed_path = DATA_DIR / "shifts_fixes.xlsx"
     if fixed_path.exists():
-        fixed_df = pd.read_excel(fixed_path).dropna(
-            subset=["Nom", "Prénom", "Jour", "Tâche", "Début", "Fin"]
+        fixed_sheet = next(
+            (s for s in pd.ExcelFile(fixed_path).sheet_names if s.lower() == jour.lower()), None
         )
-        fixed_df = fixed_df[fixed_df["Jour"].astype(str).str.strip().str.lower() == jour.lower()]
+        if fixed_sheet is not None:
+            fixed_df = pd.read_excel(fixed_path, sheet_name=fixed_sheet).dropna(
+                subset=["Nom", "Prénom", "Tâche", "Début", "Fin"]
+            )
+        else:
+            fixed_df = pd.DataFrame(columns=["Nom", "Prénom", "Tâche", "Début", "Fin"])
         for _, row in fixed_df.iterrows():
             nom = str(row["Nom"]).strip()
             prenom = str(row["Prénom"]).strip()
@@ -260,19 +294,20 @@ def load_data(jour):
                 raise ValueError(
                     f"shifts_fixes.xlsx : personne inconnue '{prenom} {nom}' (absente de personnes.xlsx)"
                 )
-            tache_norm = str(row["Tâche"]).strip().lower()
+            tache = str(row["Tâche"]).strip()
             debut = to_minutes(row["Début"])
             fin = to_minutes(row["Fin"])
             if fin <= debut:
                 fin += 24 * 60
-            shift_key = (tache_norm, debut, fin)
-            if shift_key not in shift_lookup:
-                raise ValueError(
-                    f"shifts_fixes.xlsx : créneau introuvable dans l'onglet '{jour}' de "
-                    f"plages_horaires.xlsx pour {prenom} {nom} "
-                    f"({row['Tâche']}, {minutes_to_str(debut)}-{minutes_to_str(fin)})"
-                )
-            fixed_assignments.append((key, shift_lookup[shift_key]))
+            s_idx = len(shifts)
+            shifts.append({
+                "tache": tache,
+                "tache_norm": tache.lower(),
+                "debut": debut,
+                "fin": fin,
+                "requis": 1,
+            })
+            fixed_assignments.append((key, s_idx))
 
     return shifts, people, blocages_map, fixed_assignments
 
@@ -296,6 +331,9 @@ def build_model(shifts, people, blocages_map, fixed_assignments):
 
             caps = p["capacites"]
             if not is_fixed and caps is not None and s["tache_norm"] not in caps:
+                continue
+
+            if not is_fixed and p["fonction"] == "junior.e" and s["fin"] > HEURE_LIMITE_JUNIOR_MINUTES:
                 continue
 
             blocks = blocages_map.get(p["key"], [])
@@ -325,18 +363,18 @@ def build_model(shifts, people, blocages_map, fixed_assignments):
         assigned = [x[(p_idx, s_idx)] for p_idx in range(len(people)) if (p_idx, s_idx) in x]
         model.add(sum(assigned) + shortfall[s_idx] == s["requis"])
 
-    # Chevauchements et plafond de 2 shifts dans la journée
+    # Chevauchements/pause insuffisante et plafond de shifts (selon la Fonction)
     for i in range(len(shifts)):
         for j in range(i + 1, len(shifts)):
-            if overlaps(shifts[i]["debut"], shifts[i]["fin"], shifts[j]["debut"], shifts[j]["fin"]):
+            if gap_insuffisant(shifts[i], shifts[j], PAUSE_MINIMALE_MINUTES):
                 for p_idx in range(len(people)):
                     if (p_idx, i) in x and (p_idx, j) in x:
                         model.add(x[(p_idx, i)] + x[(p_idx, j)] <= 1)
 
-    for p_idx in range(len(people)):
+    for p_idx, p in enumerate(people):
         today = [x[(p_idx, s_idx)] for s_idx in range(len(shifts)) if (p_idx, s_idx) in x]
         if today:
-            model.add(sum(today) <= TARGET_SHIFTS_PER_DAY)
+            model.add(sum(today) <= p["max_shifts"])
 
     # Équité : minimiser l'écart entre la personne la plus et la moins sollicitée
     totals = []
@@ -501,8 +539,9 @@ def main():
     print(f"Statut du solveur : {solver.status_name(status)}")
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         print("Aucune solution trouvée. Vérifiez notamment les shifts fixes : "
-              "deux shifts fixes qui se chevauchent, ou plus de 2 shifts fixes "
-              "ce jour-là pour une même personne, rendent le planning impossible.")
+              "deux shifts fixes qui se chevauchent, ou plus de shifts fixes que le "
+              "quota autorisé par sa Fonction pour une même personne ce jour-là, "
+              "rendent le planning impossible.")
         return
 
     shortfall_min = sum(solver.value(v) for v in shortfall.values())
