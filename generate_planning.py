@@ -20,19 +20,24 @@ Fichiers d'entrée attendus dans data/ :
          -> 2, "COF" -> 0 (jamais affecté, sauf shift fixe). "Capacités"
          liste les tâches que la personne peut effectuer, séparées par des
          virgules (ex: "Bar, Accueil"). Laisser vide ou écrire "Tous" si la
-         personne peut effectuer n'importe quelle tâche.
+         personne peut effectuer n'importe quelle tâche. Une personne avec
+         une seule capacité (ex: "Bourdon.ne") s'auto-gère sur cette tâche
+         et n'est jamais insérée dans le planning par le solveur (sauf
+         shift fixe).
 
   blocages.xlsx
       Un onglet par jour (comme plages_horaires.xlsx). Chaque onglet
-      contient :
-      Nom | Prénom | Début | Fin | Priorité
-      -> une ligne par plage horaire que la personne ne souhaite pas
-         travailler ce jour-là. Nom + Prénom doivent correspondre
-         exactement à une ligne de personnes.xlsx. Priorité 1 = blocage
-         absolu (jamais affecté sur ce créneau). Priorité 2 = préférence
-         (évité si possible, mais peut être utilisé pour compléter le
-         planning). Chaque personne a droit à au maximum 2 blocages par
-         jour. Un jour sans aucun blocage peut ne pas avoir d'onglet.
+      contient une ligne par personne, avec ses colonnes fixes (par
+      position, les en-têtes "Début"/"Fin" étant dupliqués) :
+      Nom | Prénom | Raison P1 | Début P1 | Fin P1 | Raison P2 | Début P2 | Fin P2
+      -> "Raison P1"/"Raison P2" (ex : nom d'un concert) sont informatifs.
+         Priorité 1 (colonnes C-E) : la personne souhaite être libre sur ce
+         créneau ; le solveur essaie de le respecter en priorité, mais peut
+         l'enfreindre si c'est nécessaire pour couvrir tous les besoins.
+         Priorité 2 (colonnes F-H) : préférence secondaire, encore moins
+         contraignante. Chaque case peut être vide (aucune contrainte sur
+         cette priorité ce jour-là). Un jour sans aucun blocage peut ne pas
+         avoir d'onglet.
 
   shifts_fixes.xlsx (optionnel)
       Un onglet par jour (comme plages_horaires.xlsx). Chaque onglet
@@ -50,24 +55,25 @@ Fichiers d'entrée attendus dans data/ :
 Règles appliquées :
   - une personne n'est jamais affectée à une tâche pour laquelle elle n'a
     pas la capacité requise (sauf shift fixe) ;
-  - une personne n'est jamais affectée sur un créneau couvert par un
-    blocage de priorité 1 (sauf shift fixe) ;
   - une personne fait au maximum 2 shifts dans la journée (1 pour un
     Junior.e, 0 pour un COF, selon la Fonction), et ne peut pas être
     affectée à deux créneaux qui se chevauchent ou qui laissent moins de
     2h de pause entre eux ;
   - un Junior.e n'est jamais affecté à un créneau qui se termine après
     23:00 (sauf shift fixe) ;
+  - une personne avec une seule capacité s'auto-gère et n'est jamais
+    affectée par le solveur (sauf shift fixe) ;
   - les shifts fixes sont toujours attribués et comptent dans le quota de
     shifts par jour ;
-  - couvrir tous les besoins en personnel (Nb_personnes) est la priorité
-    absolue du solveur ; à couverture égale seulement, il essaie d'éviter
-    les créneaux en priorité 2, puis de répartir la charge équitablement
-    entre les personnes ce jour-là.
+  - si le solveur ne peut pas tout résoudre, l'ordre de priorité est :
+    1) couvrir tous les besoins en personnel (Nb_personnes) ; 2) respecter
+    au maximum les blocages de priorité 1 (en violant le moins de
+    créneaux bloqués possible, plutôt que d'ignorer tout le blocage) ;
+    3) respecter au maximum les préférences de priorité 2 et répartir la
+    charge équitablement entre les personnes ce jour-là.
 
 Utilisation :
     pip install -r requirements.txt
-    python generate_sample_data.py   # (optionnel) génère des données d'exemple
     python generate_planning.py
     -> le script demande quel jour planifier, puis écrit le résultat dans
        output/planning_<jour>.xlsx
@@ -200,16 +206,18 @@ def load_data(jour):
     )
     personnes_df = pd.read_excel(DATA_DIR / "personnes.xlsx").dropna(subset=["Nom", "Prénom"])
 
+    # blocages.xlsx : une ligne par personne, colonnes fixes par position
+    # (A=Nom, B=Prénom, C=Raison P1, D=Début P1, E=Fin P1, F=Raison P2,
+    # G=Début P2, H=Fin P2). Les en-têtes "Début"/"Fin" sont dupliqués donc
+    # on lit par position de colonne plutôt que par nom.
     blocages_path = DATA_DIR / "blocages.xlsx"
     blocages_sheet = next(
         (s for s in pd.ExcelFile(blocages_path).sheet_names if s.lower() == jour.lower()), None
     )
     if blocages_sheet is not None:
-        blocages_df = pd.read_excel(blocages_path, sheet_name=blocages_sheet).dropna(
-            subset=["Nom", "Prénom", "Début", "Fin", "Priorité"]
-        )
+        blocages_df = pd.read_excel(blocages_path, sheet_name=blocages_sheet, header=0)
     else:
-        blocages_df = pd.DataFrame(columns=["Nom", "Prénom", "Début", "Fin", "Priorité"])
+        blocages_df = pd.DataFrame()
 
     shifts = []
     for _, row in plages_df.iterrows():
@@ -250,27 +258,30 @@ def load_data(jour):
 
     blocages_map = defaultdict(list)
     for _, row in blocages_df.iterrows():
-        nom = str(row["Nom"]).strip()
-        prenom = str(row["Prénom"]).strip()
+        nom = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
+        prenom = str(row.iloc[1]).strip() if pd.notna(row.iloc[1]) else ""
+        if not nom and not prenom:
+            continue
         key = person_key(nom, prenom)
         if key not in key_to_idx:
             raise ValueError(
                 f"blocages.xlsx : personne inconnue '{prenom} {nom}' (absente de personnes.xlsx)"
             )
-        debut = to_minutes(row["Début"])
-        fin = to_minutes(row["Fin"])
-        if fin <= debut:
-            fin += 24 * 60
-        blocages_map[key].append({
-            "debut": debut,
-            "fin": fin,
-            "priorite": int(row["Priorité"]),
-        })
-
-    for key, blocks in blocages_map.items():
-        if len(blocks) > 2:
-            nom_complet = people[key_to_idx[key]]["nom_complet"]
-            print(f"Attention : {nom_complet} a {len(blocks)} blocages déclarés le {jour} (maximum recommandé : 2).")
+        # (priorité, colonne raison, colonne début, colonne fin)
+        for priorite, col_raison, col_debut, col_fin in ((1, 2, 3, 4), (2, 5, 6, 7)):
+            if pd.isna(row.iloc[col_debut]) or pd.isna(row.iloc[col_fin]):
+                continue
+            debut = to_minutes(row.iloc[col_debut])
+            fin = to_minutes(row.iloc[col_fin])
+            if fin <= debut:
+                fin += 24 * 60
+            raison = str(row.iloc[col_raison]).strip() if pd.notna(row.iloc[col_raison]) else ""
+            blocages_map[key].append({
+                "debut": debut,
+                "fin": fin,
+                "priorite": priorite,
+                "raison": raison,
+            })
 
     # Shifts fixes (optionnel) : créneaux déjà imposés ce jour-là, ajoutés en
     # plus de ceux de plages_horaires.xlsx (pas besoin d'y correspondre).
@@ -323,6 +334,7 @@ def build_model(shifts, people, blocages_map, fixed_assignments):
     fixed_pairs = {(key_to_idx[key], s_idx) for key, s_idx in fixed_assignments}
 
     x = {}          # (p_idx, s_idx) -> BoolVar, uniquement pour les paires possibles
+    p1_pairs = set()  # paires en conflit avec un blocage de priorité 1
     p2_pairs = set()  # paires en conflit avec une préférence (priorité 2)
 
     for s_idx, s in enumerate(shifts):
@@ -333,18 +345,22 @@ def build_model(shifts, people, blocages_map, fixed_assignments):
             if not is_fixed and caps is not None and s["tache_norm"] not in caps:
                 continue
 
+            # Une seule capacité déclarée : la personne s'auto-gère sur cette
+            # tâche et n'est jamais insérée dans le planning par le solveur.
+            if not is_fixed and caps is not None and len(caps) == 1:
+                continue
+
             if not is_fixed and p["fonction"] == "junior.e" and s["fin"] > HEURE_LIMITE_JUNIOR_MINUTES:
                 continue
 
+            x[(p_idx, s_idx)] = model.new_bool_var(f"x_{p_idx}_{s_idx}")
+
             blocks = blocages_map.get(p["key"], [])
-            hard_blocked = any(
+            if any(
                 b["priorite"] == 1 and overlaps(s["debut"], s["fin"], b["debut"], b["fin"])
                 for b in blocks
-            )
-            if hard_blocked and not is_fixed:
-                continue
-
-            x[(p_idx, s_idx)] = model.new_bool_var(f"x_{p_idx}_{s_idx}")
+            ):
+                p1_pairs.add((p_idx, s_idx))
 
             if any(
                 b["priorite"] == 2 and overlaps(s["debut"], s["fin"], b["debut"], b["fin"])
@@ -389,7 +405,7 @@ def build_model(shifts, people, blocages_map, fixed_assignments):
     model.add_max_equality(max_total, totals)
     model.add_min_equality(min_total, totals)
 
-    return model, x, shortfall, p2_pairs, max_total, min_total
+    return model, x, shortfall, p1_pairs, p2_pairs, max_total, min_total
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +425,14 @@ def style_header_row(ws, row=1):
         cell.alignment = Alignment(vertical="center")
 
 
-def export_results(jour, shifts, people, x, shortfall, p2_pairs, solver, output_path):
+def trouver_raison(blocages_map, key, s, priorite):
+    for b in blocages_map.get(key, []):
+        if b["priorite"] == priorite and overlaps(s["debut"], s["fin"], b["debut"], b["fin"]):
+            return b.get("raison", "")
+    return ""
+
+
+def export_results(jour, shifts, people, x, shortfall, p1_pairs, p2_pairs, blocages_map, solver, output_path):
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -424,6 +447,8 @@ def export_results(jour, shifts, people, x, shortfall, p2_pairs, solver, output_
         for p_idx, p in enumerate(people):
             if (p_idx, s_idx) in x and solver.value(x[(p_idx, s_idx)]) == 1:
                 name = p["nom_complet"]
+                if (p_idx, s_idx) in p1_pairs:
+                    name += " (**)"
                 if (p_idx, s_idx) in p2_pairs:
                     name += " (*)"
                 assigned_names.append(name)
@@ -444,6 +469,8 @@ def export_results(jour, shifts, people, x, shortfall, p2_pairs, solver, output_
                 ws.cell(row=ws.max_row, column=col).fill = SHORTAGE_FILL
 
     ws.append([])
+    note1 = ws.cell(row=ws.max_row + 1, column=1, value="(**) Personne affectée malgré un blocage de priorité 1")
+    note1.font = Font(italic=True, size=9)
     note = ws.cell(row=ws.max_row + 1, column=1, value="(*) Personne affectée malgré une préférence de blocage (priorité 2)")
     note.font = Font(italic=True, size=9)
 
@@ -456,7 +483,7 @@ def export_results(jour, shifts, people, x, shortfall, p2_pairs, solver, output_
     ws.append(["Nom", "Shifts", "Tâches et horaires"])
     style_header_row(ws)
 
-    ordre_affichage = sorted(range(len(people)), key=lambda p_idx: (people[p_idx]["nom"].lower(), people[p_idx]["prenom"].lower()))
+    ordre_affichage = sorted(range(len(people)), key=lambda p_idx: (people[p_idx]["prenom"].lower(), people[p_idx]["nom"].lower()))
     for p_idx in ordre_affichage:
         p = people[p_idx]
         assigned = sorted(
@@ -467,6 +494,8 @@ def export_results(jour, shifts, people, x, shortfall, p2_pairs, solver, output_
         for s_idx in assigned:
             s = shifts[s_idx]
             part = f"{s['tache']} {minutes_to_str(s['debut'])}-{minutes_to_str(s['fin'])}"
+            if (p_idx, s_idx) in p1_pairs:
+                part += " (**)"
             if (p_idx, s_idx) in p2_pairs:
                 part += " (*)"
             detail_parts.append(part)
@@ -492,19 +521,38 @@ def export_results(jour, shifts, people, x, shortfall, p2_pairs, solver, output_
                 f"{manquant} personne(s) manquante(s) sur {s['requis']} requise(s)",
             ])
 
+    for (p_idx, s_idx) in p1_pairs:
+        if solver.value(x[(p_idx, s_idx)]) == 1:
+            s = shifts[s_idx]
+            p = people[p_idx]
+            raison = trouver_raison(blocages_map, p["key"], s, priorite=1)
+            detail = f"{p['nom_complet']} avait un blocage (priorité 1) sur ce créneau"
+            if raison:
+                detail += f" ({raison})"
+            ws.append([
+                "Blocage priorité 1 non respecté",
+                s["tache"],
+                f"{minutes_to_str(s['debut'])}-{minutes_to_str(s['fin'])}",
+                detail,
+            ])
+
     for (p_idx, s_idx) in p2_pairs:
         if solver.value(x[(p_idx, s_idx)]) == 1:
             s = shifts[s_idx]
             p = people[p_idx]
+            raison = trouver_raison(blocages_map, p["key"], s, priorite=2)
+            detail = f"{p['nom_complet']} avait indiqué une préférence (priorité 2) sur ce créneau"
+            if raison:
+                detail += f" ({raison})"
             ws.append([
                 "Préférence non respectée",
                 s["tache"],
                 f"{minutes_to_str(s['debut'])}-{minutes_to_str(s['fin'])}",
-                f"{p['nom_complet']} avait indiqué une préférence (priorité 2) sur ce créneau",
+                detail,
             ])
 
     if ws.max_row == 1:
-        ws.append(["Aucune", "-", "-", "Tous les besoins sont couverts et toutes les préférences respectées"])
+        ws.append(["Aucune", "-", "-", "Tous les besoins sont couverts et tous les blocages respectés"])
 
     for col, width in enumerate([24, 16, 14, 70], start=1):
         ws.column_dimensions[get_column_letter(col)].width = width
@@ -525,7 +573,9 @@ def main():
     print(f"{jour} : {len(shifts)} créneaux à couvrir, {len(people)} personnes dans l'équipe, "
           f"{len(fixed_assignments)} shift(s) fixe(s).")
 
-    model, x, shortfall, p2_pairs, max_total, min_total = build_model(shifts, people, blocages_map, fixed_assignments)
+    model, x, shortfall, p1_pairs, p2_pairs, max_total, min_total = build_model(
+        shifts, people, blocages_map, fixed_assignments
+    )
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = SOLVER_TIME_LIMIT_SECONDS
@@ -546,19 +596,28 @@ def main():
 
     shortfall_min = sum(solver.value(v) for v in shortfall.values())
 
-    # Phase 2 : à couverture de personnel égale, optimiser préférences et équité.
-    p2_penalty = sum(x[pair] for pair in p2_pairs) if p2_pairs else 0
+    # Phase 2 : à couverture égale, respecter au maximum les blocages priorité 1.
+    p1_penalty = sum(x[pair] for pair in p1_pairs) if p1_pairs else 0
     model.add(total_shortfall_expr <= shortfall_min)
+    model.minimize(p1_penalty)
+    solver.solve(model)
+    p1_violations_min = sum(solver.value(x[pair]) for pair in p1_pairs) if p1_pairs else 0
+
+    # Phase 3 : à couverture et respect priorité 1 égaux, optimiser préférences et équité.
+    p2_penalty = sum(x[pair] for pair in p2_pairs) if p2_pairs else 0
+    model.add(p1_penalty <= p1_violations_min)
     model.minimize(W_PRIORITY2 * p2_penalty + W_FAIRNESS * (max_total - min_total))
-    status = solver.solve(model)
+    solver.solve(model)
 
     total_shortfall = sum(solver.value(v) for v in shortfall.values())
+    total_p1 = sum(solver.value(x[pair]) for pair in p1_pairs) if p1_pairs else 0
     total_p2 = sum(solver.value(x[pair]) for pair in p2_pairs)
     print(f"Créneaux non couverts (somme) : {total_shortfall}")
+    print(f"Blocages priorité 1 non respectés : {total_p1}")
     print(f"Préférences (priorité 2) non respectées : {total_p2}")
 
     output_path = OUTPUT_DIR / f"planning_{jour}.xlsx"
-    export_results(jour, shifts, people, x, shortfall, p2_pairs, solver, output_path)
+    export_results(jour, shifts, people, x, shortfall, p1_pairs, p2_pairs, blocages_map, solver, output_path)
     print(f"Planning généré : {output_path}")
 
 
