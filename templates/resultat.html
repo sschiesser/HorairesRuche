@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>Planning {{ jour }}</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; color: #222; }
+        h1 { font-size: 1.4em; }
+        .messages { background: #f4f4f4; padding: 12px; border-radius: 4px; white-space: pre-wrap; font-family: monospace; font-size: 0.9em; }
+        .succes { background: #dff0d8; padding: 10px; border-radius: 4px; }
+        .echec { background: #f4b084; padding: 10px; border-radius: 4px; }
+        a.bouton { display: inline-block; margin-top: 16px; background: #305496; color: white; padding: 10px 20px; border-radius: 4px; text-decoration: none; }
+        a.bouton:hover { background: #233c6e; }
+        a.retour { display: block; margin-top: 16px; }
+    </style>
+</head>
+<body>
+    <h1>Planning du {{ jour }}</h1>
+
+    <div class="{{ 'succes' if resultat.success else 'echec' }}">
+        <div class="messages">{{ resultat.messages | join('\n') }}</div>
+    </div>
+
+    {% if resultat.success %}
+    <a class="bouton" href="/telecharger/{{ jour }}">Télécharger le planning ({{ jour }}.xlsx)</a>
+    {% endif %}
+
+    <a class="retour" href="/">&larr; Générer un autre jour</a>
+</body>
+</html>

@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>Générateur de planning</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; color: #222; }
+        h1 { font-size: 1.4em; }
+        select, button { font-size: 1em; padding: 8px; margin-top: 8px; }
+        button { background: #305496; color: white; border: none; border-radius: 4px; cursor: pointer; padding: 10px 20px; }
+        button:hover { background: #233c6e; }
+        .erreur { background: #f4b084; padding: 10px; border-radius: 4px; margin-bottom: 16px; white-space: pre-wrap; }
+        .loading { display: none; margin-top: 12px; color: #555; }
+    </style>
+</head>
+<body>
+    <h1>Générateur de planning</h1>
+
+    {% if erreur %}
+    <div class="erreur">{{ erreur }}</div>
+    {% endif %}
+
+    <form method="post" action="/generer" onsubmit="document.getElementById('loading').style.display='block';">
+        <label for="jour">Jour à planifier :</label><br>
+        <select name="jour" id="jour" required>
+            {% for jour in jours %}
+            <option value="{{ jour }}">{{ jour }}</option>
+            {% endfor %}
+        </select><br>
+        <button type="submit">Générer le planning</button>
+        <div class="loading" id="loading">Génération en cours, cela peut prendre jusqu'à une minute...</div>
+    </form>
+</body>
+</html>

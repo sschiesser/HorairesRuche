@@ -23,7 +23,10 @@ Fichiers d'entrée attendus dans data/ :
          personne peut effectuer n'importe quelle tâche. Une personne avec
          une seule capacité (ex: "Bourdon.ne") s'auto-gère sur cette tâche
          et n'est jamais insérée dans le planning par le solveur (sauf
-         shift fixe).
+         shift fixe) ; elle ne compte jamais dans le Nb_personnes requis sur
+         cette tâche, même via un shift fixe : un créneau demandant par
+         exemple 3 personnes a besoin de 3 personnes du pool normal, en plus
+         de la ou des personnes auto-gérées éventuellement présentes.
 
   blocages.xlsx
       Un onglet par jour (comme plages_horaires.xlsx). Chaque onglet
@@ -62,7 +65,8 @@ Règles appliquées :
   - un Junior.e n'est jamais affecté à un créneau qui se termine après
     23:00 (sauf shift fixe) ;
   - une personne avec une seule capacité s'auto-gère et n'est jamais
-    affectée par le solveur (sauf shift fixe) ;
+    affectée par le solveur (sauf shift fixe), et ne compte jamais dans le
+    Nb_personnes requis d'une tâche (même via un shift fixe) ;
   - les shifts fixes sont toujours attribués et comptent dans le quota de
     shifts par jour ;
   - si le solveur ne peut pas tout résoudre, l'ordre de priorité est :
@@ -228,6 +232,7 @@ def load_data(jour):
         shifts.append({
             "tache": str(row["Tâche"]).strip(),
             "tache_norm": str(row["Tâche"]).strip().lower(),
+            "origine": "plages",
             "debut": debut,
             "fin": fin,
             "requis": int(row["Nb_personnes"]),
@@ -238,6 +243,7 @@ def load_data(jour):
         nom = str(row["Nom"]).strip()
         prenom = str(row["Prénom"]).strip()
         fonction = str(row.get("Fonction", "")).strip()
+        capacites = parse_capacites(row.get("Capacités"))
         people.append({
             "nom": nom,
             "prenom": prenom,
@@ -245,7 +251,8 @@ def load_data(jour):
             "key": person_key(nom, prenom),
             "fonction": fonction.lower(),
             "max_shifts": MAX_SHIFTS_PAR_FONCTION.get(fonction.lower(), TARGET_SHIFTS_PER_DAY),
-            "capacites": parse_capacites(row.get("Capacités")),
+            "capacites": capacites,
+            "auto_gere": capacites is not None and len(capacites) == 1,
         })
 
     key_counts = Counter(p["key"] for p in people)
@@ -314,6 +321,7 @@ def load_data(jour):
             shifts.append({
                 "tache": tache,
                 "tache_norm": tache.lower(),
+                "origine": "fixe",
                 "debut": debut,
                 "fin": fin,
                 "requis": 1,
@@ -347,7 +355,7 @@ def build_model(shifts, people, blocages_map, fixed_assignments):
 
             # Une seule capacité déclarée : la personne s'auto-gère sur cette
             # tâche et n'est jamais insérée dans le planning par le solveur.
-            if not is_fixed and caps is not None and len(caps) == 1:
+            if not is_fixed and p["auto_gere"]:
                 continue
 
             if not is_fixed and p["fonction"] == "junior.e" and s["fin"] > HEURE_LIMITE_JUNIOR_MINUTES:
@@ -372,11 +380,19 @@ def build_model(shifts, people, blocages_map, fixed_assignments):
     for pair in fixed_pairs:
         model.add(x[pair] == 1)
 
-    # Couverture des besoins : assignés + manquants == requis
+    # Couverture des besoins : assignés + manquants == requis. Sur les
+    # créneaux de plages_horaires.xlsx, les personnes auto-gérées (une seule
+    # capacité) ne comptent jamais dans ce besoin, même affectées via un
+    # shift fixe : le besoin doit être couvert par le pool normal, en plus
+    # d'elles. Sur un créneau créé par shifts_fixes.xlsx (requis=1, réservé à
+    # la personne fixée), on compte tout le monde normalement.
     shortfall = {}
     for s_idx, s in enumerate(shifts):
         shortfall[s_idx] = model.new_int_var(0, s["requis"], f"shortfall_{s_idx}")
-        assigned = [x[(p_idx, s_idx)] for p_idx in range(len(people)) if (p_idx, s_idx) in x]
+        assigned = [
+            x[(p_idx, s_idx)] for p_idx, p in enumerate(people)
+            if (p_idx, s_idx) in x and not (s["origine"] == "plages" and p["auto_gere"])
+        ]
         model.add(sum(assigned) + shortfall[s_idx] == s["requis"])
 
     # Chevauchements/pause insuffisante et plafond de shifts (selon la Fonction)
@@ -563,15 +579,21 @@ def export_results(jour, shifts, people, x, shortfall, p1_pairs, p2_pairs, bloca
 
 
 # ---------------------------------------------------------------------------
-# Programme principal
+# Orchestration (utilisée par la CLI et par l'application web)
 # ---------------------------------------------------------------------------
 
-def main():
-    jour = demander_jour(lister_jours_disponibles())
+def generer_planning(jour):
+    """Charge les données, résout le modèle et exporte le planning pour un
+    jour donné. Renvoie un dict (success, messages, output_path, totaux).
+    Les erreurs de données (ValueError levée par load_data) ne sont pas
+    interceptées : à l'appelant de les afficher comme il convient."""
+    messages = []
 
     shifts, people, blocages_map, fixed_assignments = load_data(jour)
-    print(f"{jour} : {len(shifts)} créneaux à couvrir, {len(people)} personnes dans l'équipe, "
-          f"{len(fixed_assignments)} shift(s) fixe(s).")
+    messages.append(
+        f"{jour} : {len(shifts)} créneaux à couvrir, {len(people)} personnes dans l'équipe, "
+        f"{len(fixed_assignments)} shift(s) fixe(s)."
+    )
 
     model, x, shortfall, p1_pairs, p2_pairs, max_total, min_total = build_model(
         shifts, people, blocages_map, fixed_assignments
@@ -586,13 +608,15 @@ def main():
     model.minimize(total_shortfall_expr)
     status = solver.solve(model)
 
-    print(f"Statut du solveur : {solver.status_name(status)}")
+    messages.append(f"Statut du solveur : {solver.status_name(status)}")
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        print("Aucune solution trouvée. Vérifiez notamment les shifts fixes : "
-              "deux shifts fixes qui se chevauchent, ou plus de shifts fixes que le "
-              "quota autorisé par sa Fonction pour une même personne ce jour-là, "
-              "rendent le planning impossible.")
-        return
+        messages.append(
+            "Aucune solution trouvée. Vérifiez notamment les shifts fixes : "
+            "deux shifts fixes qui se chevauchent, ou plus de shifts fixes que le "
+            "quota autorisé par sa Fonction pour une même personne ce jour-là, "
+            "rendent le planning impossible."
+        )
+        return {"success": False, "messages": messages, "output_path": None}
 
     shortfall_min = sum(solver.value(v) for v in shortfall.values())
 
@@ -612,13 +636,33 @@ def main():
     total_shortfall = sum(solver.value(v) for v in shortfall.values())
     total_p1 = sum(solver.value(x[pair]) for pair in p1_pairs) if p1_pairs else 0
     total_p2 = sum(solver.value(x[pair]) for pair in p2_pairs)
-    print(f"Créneaux non couverts (somme) : {total_shortfall}")
-    print(f"Blocages priorité 1 non respectés : {total_p1}")
-    print(f"Préférences (priorité 2) non respectées : {total_p2}")
+    messages.append(f"Créneaux non couverts (somme) : {total_shortfall}")
+    messages.append(f"Blocages priorité 1 non respectés : {total_p1}")
+    messages.append(f"Préférences (priorité 2) non respectées : {total_p2}")
 
     output_path = OUTPUT_DIR / f"planning_{jour}.xlsx"
     export_results(jour, shifts, people, x, shortfall, p1_pairs, p2_pairs, blocages_map, solver, output_path)
-    print(f"Planning généré : {output_path}")
+    messages.append(f"Planning généré : {output_path}")
+
+    return {
+        "success": True,
+        "messages": messages,
+        "output_path": output_path,
+        "total_shortfall": total_shortfall,
+        "total_p1": total_p1,
+        "total_p2": total_p2,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Programme principal (CLI)
+# ---------------------------------------------------------------------------
+
+def main():
+    jour = demander_jour(lister_jours_disponibles())
+    resultat = generer_planning(jour)
+    for message in resultat["messages"]:
+        print(message)
 
 
 if __name__ == "__main__":
