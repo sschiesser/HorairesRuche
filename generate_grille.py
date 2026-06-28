@@ -26,7 +26,8 @@ from collections import defaultdict
 
 import pandas as pd
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.worksheet.page import PageMargins
 
 from generate_planning import DATA_DIR, JOURS_VALIDES, OUTPUT_DIR, to_minutes
 
@@ -46,15 +47,29 @@ MINUTES_PAR_COLONNE = 5
 COL_DEBUT_GRILLE = 3
 COL_FIN_GRILLE = COL_DEBUT_GRILLE + (GRID_END_MINUTES - GRID_START_MINUTES) // MINUTES_PAR_COLONNE - 1
 
-FOND_SOMBRE = PatternFill("solid", fgColor="0D1B2A")
-FOND_ENTETE = PatternFill("solid", fgColor="1F2A38")
-FOND_TIMELINE = PatternFill("solid", fgColor="2F3640")
-FOND_CONCERT = PatternFill("solid", fgColor="FFD966")
-FOND_PLANNING = PatternFill("solid", fgColor="FFE699")
-TEXTE_BLANC = Font(color="FFFFFF", bold=True)
-TEXTE_GRIS = Font(color="AAAAAA", size=8)
-TEXTE_CONCERT = Font(color="7F6000", bold=True, size=8)
-TEXTE_PLANNING = Font(color="7F5800", size=7)
+# Palette noir & blanc (économise l'encre à l'impression) : pas d'aplats
+# sombres, juste des nuances de gris clair pour distinguer les zones, et du
+# texte noir partout.
+FOND_LABEL = PatternFill("solid", fgColor="D9D9D9")
+FOND_ENTETE = PatternFill("solid", fgColor="BFBFBF")
+FOND_TIMELINE = PatternFill("solid", fgColor="FFFFFF")
+FOND_CONCERT = PatternFill("solid", fgColor="D9D9D9")
+FOND_PLANNING = PatternFill("solid", fgColor="F2F2F2")
+TEXTE_LABEL = Font(color="000000", bold=True)
+TEXTE_HEURE = Font(color="000000", size=8)
+TEXTE_CONCERT = Font(color="000000", bold=True, size=8)
+TEXTE_PLANNING = Font(color="000000", size=7)
+
+# Quadrillage de la timeline : trait fin entre les colonnes de 5 minutes,
+# trait plus marqué à chaque heure pleine, pour pouvoir lire les horaires
+# avec exactitude.
+BORDURE_FINE = Side(style="thin", color="BFBFBF")
+BORDURE_HEURE = Side(style="thin", color="000000")
+
+
+def bordure_pour_colonne(col: int) -> Border:
+    cote_gauche = BORDURE_HEURE if (col - COL_DEBUT_GRILLE) % 12 == 0 else BORDURE_FINE
+    return Border(left=cote_gauche, right=BORDURE_FINE, top=BORDURE_FINE, bottom=BORDURE_FINE)
 
 
 def minutes_ajustees(valeur_brute) -> int:
@@ -174,21 +189,25 @@ def ecrire_entete_heures(ws, ligne):
     while minutes < GRID_END_MINUTES:
         col = colonne_pour_minutes(minutes)
         cell = ws.cell(row=ligne, column=col, value=f"{(minutes % (24 * 60)) // 60:02d}h")
-        cell.font = TEXTE_GRIS
+        cell.font = TEXTE_HEURE
         minutes += 60
     for col in range(COL_DEBUT_GRILLE, COL_FIN_GRILLE + 1):
-        ws.cell(row=ligne, column=col).fill = FOND_ENTETE
+        cell = ws.cell(row=ligne, column=col)
+        cell.fill = FOND_ENTETE
+        cell.border = bordure_pour_colonne(col)
     ws.row_dimensions[ligne].height = 14
 
 
 def ecrire_ligne(ws, ligne, label, evenements, fond_evenement, texte_evenement, hauteur=20):
     cell_label = ws.cell(row=ligne, column=1, value=label)
-    cell_label.fill = FOND_SOMBRE
-    cell_label.font = TEXTE_BLANC
+    cell_label.fill = FOND_LABEL
+    cell_label.font = TEXTE_LABEL
     cell_label.alignment = Alignment(horizontal="right", vertical="center")
 
     for col in range(COL_DEBUT_GRILLE, COL_FIN_GRILLE + 1):
-        ws.cell(row=ligne, column=col).fill = FOND_TIMELINE
+        cell = ws.cell(row=ligne, column=col)
+        cell.fill = FOND_TIMELINE
+        cell.border = bordure_pour_colonne(col)
 
     for texte, debut_min, fin_min in evenements:
         plage = plage_colonnes(debut_min, fin_min)
@@ -197,18 +216,73 @@ def ecrire_ligne(ws, ligne, label, evenements, fond_evenement, texte_evenement, 
         col_debut, col_fin = plage
         if col_fin > col_debut:
             ws.merge_cells(start_row=ligne, start_column=col_debut, end_row=ligne, end_column=col_fin)
-        cell = ws.cell(row=ligne, column=col_debut, value=texte)
-        cell.fill = fond_evenement
-        cell.font = texte_evenement
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for col in range(col_debut, col_fin + 1):
+            cell = ws.cell(row=ligne, column=col)
+            cell.fill = fond_evenement
+            cell.border = bordure_pour_colonne(col)
+        cell_ancre = ws.cell(row=ligne, column=col_debut, value=texte)
+        cell_ancre.font = texte_evenement
+        cell_ancre.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     ws.row_dimensions[ligne].height = hauteur
+
+
+def assigner_lanes(evenements):
+    """Répartit des événements qui peuvent se chevaucher (ex: une animation
+    continue qui couvre plusieurs concerts ponctuels) sur autant de lignes
+    ("lanes") que nécessaire, afin de ne jamais fusionner deux cellules qui
+    se chevauchent. Renvoie une liste de lignes, chacune une liste
+    d'événements ; toujours au moins une ligne (éventuellement vide)."""
+    lanes = []
+    fins_lanes = []
+    for evt in sorted(evenements, key=lambda e: e[1]):
+        _, debut, _ = evt
+        # On regarde les lignes existantes de la plus récemment utilisée à
+        # la plus ancienne : les évènements courts et consécutifs
+        # continuent ainsi de remplir la même ligne, plutôt que de
+        # reprendre une ligne juste libérée par un évènement isolé très
+        # long (ex: une animation continue).
+        for i in range(len(fins_lanes) - 1, -1, -1):
+            if fins_lanes[i] <= debut:
+                lanes[i].append(evt)
+                fins_lanes[i] = evt[2]
+                break
+        else:
+            lanes.append([evt])
+            fins_lanes.append(evt[2])
+    lanes = lanes or [[]]
+    # Les lignes les plus "denses" (le plus d'événements, donc les plus
+    # courts) passent en premier ; une ligne avec peu d'événements longs
+    # (ex: une animation continue) passe en dessous.
+    lanes.sort(key=len, reverse=True)
+    return lanes
+
+
+def hauteur_pour_lanes(hauteur_standard, nb_lanes: int):
+    if nb_lanes <= 1:
+        return hauteur_standard
+    return hauteur_standard * 2 / 3
 
 
 def ajuster_largeurs_colonnes(ws):
     ws.column_dimensions["A"].width = 22
     for col in range(2, COL_FIN_GRILLE + 1):
         ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = 1.5
+
+
+def configurer_impression(ws):
+    """Met en page pour une impression sur papier A4 : paysage, marges
+    réduites, mise à l'échelle pour tenir sur la hauteur d'une page (la
+    largeur s'étale sur autant de pages que nécessaire, à la même échelle),
+    et la colonne des libellés répétée sur chaque page imprimée."""
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.fitToWidth = 0
+    ws.page_setup.fitToHeight = 1
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_margins = PageMargins(left=0.2, right=0.2, top=0.3, bottom=0.3, header=0, footer=0)
+    ws.print_title_cols = "A:A"
+    ws.print_options.horizontalCentered = True
 
 
 def construire_grille(output_path):
@@ -232,29 +306,36 @@ def construire_grille(output_path):
         ws = wb.create_sheet(title=titre[:31])
 
         titre_cell = ws.cell(row=1, column=1, value=titre)
-        titre_cell.font = Font(bold=True, size=14, color="FFFFFF")
-        titre_cell.fill = FOND_SOMBRE
+        titre_cell.font = Font(bold=True, size=14, color="000000")
+        titre_cell.fill = FOND_LABEL
         ws.row_dimensions[1].height = 20
 
         ecrire_entete_heures(ws, 2)
 
         ligne = 3
         for scene in scenes:
-            ecrire_ligne(ws, ligne, scene, concerts.get((scene, date), []), FOND_CONCERT, TEXTE_CONCERT, hauteur=26)
-            ligne += 1
+            lanes = assigner_lanes(concerts.get((scene, date), []))
+            hauteur = hauteur_pour_lanes(26, len(lanes))
+            for i, lane in enumerate(lanes):
+                ecrire_ligne(ws, ligne, scene if i == 0 else "", lane, FOND_CONCERT, TEXTE_CONCERT, hauteur=hauteur)
+                ligne += 1
 
         ligne += 1
-        ws.cell(row=ligne, column=1, value="Plannings").font = Font(bold=True, color="FFFFFF", size=8)
+        ws.cell(row=ligne, column=1, value="Plannings").font = Font(bold=True, color="000000", size=8)
         ws.cell(row=ligne, column=1).fill = FOND_ENTETE
         ecrire_entete_heures(ws, ligne)
         ligne += 1
 
         taches = charger_taches_planning(planning_path, jour)
         for tache, evenements in taches.items():
-            ecrire_ligne(ws, ligne, tache, evenements, FOND_PLANNING, TEXTE_PLANNING, hauteur=20)
-            ligne += 1
+            lanes = assigner_lanes(evenements)
+            hauteur = hauteur_pour_lanes(20, len(lanes))
+            for i, lane in enumerate(lanes):
+                ecrire_ligne(ws, ligne, tache if i == 0 else "", lane, FOND_PLANNING, TEXTE_PLANNING, hauteur=hauteur)
+                ligne += 1
 
         ajuster_largeurs_colonnes(ws)
+        configurer_impression(ws)
         ws.freeze_panes = "C3"
 
     if not wb.sheetnames:

@@ -247,7 +247,6 @@ def load_data(jour):
         people.append({
             "nom": nom,
             "prenom": prenom,
-            "nom_complet": f"{prenom} {nom}".strip(),
             "key": person_key(nom, prenom),
             "fonction": fonction.lower(),
             "max_shifts": MAX_SHIFTS_PAR_FONCTION.get(fonction.lower(), TARGET_SHIFTS_PER_DAY),
@@ -255,8 +254,19 @@ def load_data(jour):
             "auto_gere": capacites is not None and len(capacites) == 1,
         })
 
+    # Nom d'affichage : le prénom seul pour gagner de la place ; complété de
+    # la 1re lettre du nom de famille seulement si le prénom n'est pas unique.
+    prenom_counts = Counter(p["prenom"].lower() for p in people)
+    for p in people:
+        if prenom_counts[p["prenom"].lower()] > 1 and p["nom"]:
+            p["nom_affichage"] = f"{p['prenom']} {p['nom'][0]}."
+        else:
+            p["nom_affichage"] = p["prenom"]
+
     key_counts = Counter(p["key"] for p in people)
-    doublons = sorted({p["nom_complet"] for p in people if key_counts[p["key"]] > 1})
+    doublons = sorted({
+        f"{p['prenom']} {p['nom']}".strip() for p in people if key_counts[p["key"]] > 1
+    })
     if doublons:
         raise ValueError(
             f"personnes.xlsx : personne(s) en double (même Nom + Prénom) : {', '.join(doublons)}"
@@ -462,7 +472,7 @@ def export_results(jour, shifts, people, x, shortfall, p1_pairs, p2_pairs, bloca
         assigned_names = []
         for p_idx, p in enumerate(people):
             if (p_idx, s_idx) in x and solver.value(x[(p_idx, s_idx)]) == 1:
-                name = p["nom_complet"]
+                name = p["nom_affichage"]
                 if (p_idx, s_idx) in p1_pairs:
                     name += " (**)"
                 if (p_idx, s_idx) in p2_pairs:
@@ -515,7 +525,7 @@ def export_results(jour, shifts, people, x, shortfall, p1_pairs, p2_pairs, bloca
             if (p_idx, s_idx) in p2_pairs:
                 part += " (*)"
             detail_parts.append(part)
-        ws.append([p["nom_complet"], len(assigned), "; ".join(detail_parts)])
+        ws.append([p["nom_affichage"], len(assigned), "; ".join(detail_parts)])
 
     ws.column_dimensions["A"].width = 22
     ws.column_dimensions["B"].width = 10
@@ -542,7 +552,7 @@ def export_results(jour, shifts, people, x, shortfall, p1_pairs, p2_pairs, bloca
             s = shifts[s_idx]
             p = people[p_idx]
             raison = trouver_raison(blocages_map, p["key"], s, priorite=1)
-            detail = f"{p['nom_complet']} avait un blocage (priorité 1) sur ce créneau"
+            detail = f"{p['nom_affichage']} avait un blocage (priorité 1) sur ce créneau"
             if raison:
                 detail += f" ({raison})"
             ws.append([
@@ -557,7 +567,7 @@ def export_results(jour, shifts, people, x, shortfall, p1_pairs, p2_pairs, bloca
             s = shifts[s_idx]
             p = people[p_idx]
             raison = trouver_raison(blocages_map, p["key"], s, priorite=2)
-            detail = f"{p['nom_complet']} avait indiqué une préférence (priorité 2) sur ce créneau"
+            detail = f"{p['nom_affichage']} avait indiqué une préférence (priorité 2) sur ce créneau"
             if raison:
                 detail += f" ({raison})"
             ws.append([
