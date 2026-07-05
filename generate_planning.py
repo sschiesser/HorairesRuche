@@ -18,29 +18,30 @@ Fichiers d'entrée attendus dans data/ :
          famille). "Fonction" détermine le nombre maximum de shifts par
          jour pour cette personne : "Junior.e" -> 1, "Staff"/"Adjoint.e"
          -> 2, "COF" -> 0 (jamais affecté, sauf shift fixe). "Capacités"
-         liste les tâches que la personne peut effectuer, séparées par des
-         virgules (ex: "Bar, Accueil"). Laisser vide ou écrire "Tous" si la
-         personne peut effectuer n'importe quelle tâche. Une personne avec
-         une seule capacité (ex: "Bourdon.ne") s'auto-gère sur cette tâche
-         et n'est jamais insérée dans le planning par le solveur (sauf
-         shift fixe) ; elle ne compte jamais dans le Nb_personnes requis sur
-         cette tâche, même via un shift fixe : un créneau demandant par
-         exemple 3 personnes a besoin de 3 personnes du pool normal, en plus
-         de la ou des personnes auto-gérées éventuellement présentes.
+         liste les tâches que la personne peut effectuer. Trois syntaxes :
+           - vide / "Tous" / "*"           → toutes les tâches
+           - "Bar loges, Bar public"        → uniquement ces tâches
+           - "* - Bar loges, Bar public"    → toutes les tâches SAUF ces-là
+         Une personne avec une seule capacité (ex: "Bourdon.ne") s'auto-gère
+         sur cette tâche et n'est jamais insérée dans le planning par le
+         solveur (sauf shift fixe) ; elle ne compte jamais dans le
+         Nb_personnes requis sur cette tâche, même via un shift fixe : un
+         créneau demandant par exemple 3 personnes a besoin de 3 personnes
+         du pool normal, en plus de la ou des personnes auto-gérées.
 
   blocages.xlsx
       Un onglet par jour (comme plages_horaires.xlsx). Chaque onglet
       contient une ligne par personne, avec ses colonnes fixes (par
       position, les en-têtes "Début"/"Fin" étant dupliqués) :
-      Nom | Prénom | Raison P1 | Début P1 | Fin P1 | Raison P2 | Début P2 | Fin P2
-      -> "Raison P1"/"Raison P2" (ex : nom d'un concert) sont informatifs.
-         Priorité 1 (colonnes C-E) : la personne souhaite être libre sur ce
-         créneau ; le solveur essaie de le respecter en priorité, mais peut
-         l'enfreindre si c'est nécessaire pour couvrir tous les besoins.
-         Priorité 2 (colonnes F-H) : préférence secondaire, encore moins
-         contraignante. Chaque case peut être vide (aucune contrainte sur
-         cette priorité ce jour-là). Un jour sans aucun blocage peut ne pas
-         avoir d'onglet.
+      Nom | Prénom | Raison P1 | Début P1 | Fin P1 | Raison P2 | Début P2 | Fin P2 | Raison P3 | Début P3 | Fin P3
+      -> "Raison P1"/"Raison P2"/"Raison P3" (ex : nom d'un concert) sont
+         informatifs. Il y a 3 niveaux de priorité, décroissants : le
+         solveur essaie de respecter la priorité 1 (colonnes C-E) avant la
+         priorité 2 (colonnes F-H), elle-même avant la priorité 3 (colonnes
+         I-K), mais peut enfreindre n'importe laquelle si c'est nécessaire
+         pour couvrir tous les besoins. Chaque case peut être vide (aucune
+         contrainte sur cette priorité ce jour-là). Un jour sans aucun
+         blocage peut ne pas avoir d'onglet.
 
   shifts_fixes.xlsx (optionnel)
       Un onglet par jour (comme plages_horaires.xlsx). Chaque onglet
@@ -69,12 +70,19 @@ Règles appliquées :
     Nb_personnes requis d'une tâche (même via un shift fixe) ;
   - les shifts fixes sont toujours attribués et comptent dans le quota de
     shifts par jour ;
+  - sur la semaine, chaque personne (sauf Junior.e, COF et auto-gérée)
+    doit passer au moins une fois par un créneau "Déambule" ou par un
+    créneau tardif (qui commence à 22:00 ou après) ; le solveur regarde ce
+    qui a déjà été généré pour les autres jours (output/planning_<Jour>.xlsx)
+    pour répartir ce passage sur la semaine plutôt que de le forcer chaque
+    jour ;
   - si le solveur ne peut pas tout résoudre, l'ordre de priorité est :
     1) couvrir tous les besoins en personnel (Nb_personnes) ; 2) respecter
-    au maximum les blocages de priorité 1 (en violant le moins de
-    créneaux bloqués possible, plutôt que d'ignorer tout le blocage) ;
-    3) respecter au maximum les préférences de priorité 2 et répartir la
-    charge équitablement entre les personnes ce jour-là.
+    au maximum les blocages de priorité 1, puis 2, puis 3 (en violant le
+    moins de créneaux bloqués possible, plutôt que d'ignorer tout le
+    blocage) ; 3) faire passer chacun par un créneau Déambule/tardif au
+    moins une fois sur la semaine ; 4) répartir la charge équitablement
+    entre les personnes ce jour-là.
 
 Utilisation :
     pip install -r requirements.txt
@@ -89,7 +97,7 @@ from pathlib import Path
 
 import pandas as pd
 from ortools.sat.python import cp_model
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -97,16 +105,15 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 OUTPUT_DIR = BASE_DIR / "output"
 
-# Couvrir les besoins en personnel (shortfall) est résolu en priorité absolue
-# (1re phase), avant d'optimiser les objectifs secondaires suivants (2e phase),
-# du plus important au moins important :
-W_PRIORITY2 = 50     # éviter d'affecter quelqu'un sur une préférence (priorité 2)
-W_FAIRNESS = 1       # répartir la charge de travail équitablement
+# Couverture, puis blocages priorité 1/2/3, puis passage Déambule/tardif,
+# puis équité : chacun est résolu dans sa propre phase (cascade lexico-
+# graphique), du plus important au moins important. Voir generer_planning().
 
 TARGET_SHIFTS_PER_DAY = 2
 SOLVER_TIME_LIMIT_SECONDS = 30
 PAUSE_MINIMALE_MINUTES = 120  # pause minimale entre deux shifts d'une même personne
 HEURE_LIMITE_JUNIOR_MINUTES = 23 * 60  # un Junior.e ne termine jamais après 23:00
+HEURE_DEBUT_TARDIF_MINUTES = 22 * 60  # un créneau est "tardif" s'il commence à 22:00 ou après
 
 # Nombre maximum de shifts par jour selon la "Fonction" (personnes.xlsx).
 # Une Fonction non reconnue utilise TARGET_SHIFTS_PER_DAY par défaut.
@@ -159,11 +166,21 @@ def gap_insuffisant(s1, s2, pause_minimale: int) -> bool:
 
 
 def parse_capacites(value):
-    """Renvoie un set de tâches (en minuscules) ou None si la personne peut tout faire."""
+    """Renvoie un set de tâches (en minuscules), None si la personne peut tout
+    faire, ou un tuple ("exclude", set) pour la syntaxe "* - tâche1, tâche2"
+    (toutes les tâches sauf celles listées). La résolution du tuple en set
+    final se fait dans load_data, une fois la liste complète des tâches connue."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
     value = str(value).strip()
     if value == "" or value.lower() in ("tous", "toutes", "*", "all"):
+        return None
+    if value.startswith("*"):
+        # "* - tâche1, tâche2" → toutes les tâches sauf celles-ci
+        reste = value[1:].strip()
+        if reste.startswith("-"):
+            exclusions = {p.strip().lower() for p in reste[1:].split(",") if p.strip()}
+            return ("exclude", exclusions)
         return None
     return {part.strip().lower() for part in value.split(",") if part.strip()}
 
@@ -198,6 +215,64 @@ def demander_jour(jours_disponibles):
         if choix.isdigit() and 1 <= int(choix) <= len(jours_disponibles):
             return jours_disponibles[int(choix) - 1]
         print("Jour non reconnu, merci de réessayer.")
+
+
+# ---------------------------------------------------------------------------
+# Rotation Déambule / créneaux tardifs sur la semaine
+# ---------------------------------------------------------------------------
+
+def est_deambule_ou_tardif(tache_norm: str, debut_minutes: int) -> bool:
+    return "déambule" in tache_norm or debut_minutes >= HEURE_DEBUT_TARDIF_MINUTES
+
+
+def construire_lookup_affichage(people):
+    """Associe chaque nom_affichage (tel qu'écrit dans les plannings déjà
+    générés) à la clé de la personne correspondante. Un nom_affichage
+    partagé par deux personnes (cas non prévu) est écarté : on ne peut pas
+    deviner sans ambiguïté de qui il s'agit."""
+    lookup = {}
+    ambigus = set()
+    for p in people:
+        cle_affichage = p["nom_affichage"].strip().lower()
+        if cle_affichage in lookup and lookup[cle_affichage] != p["key"]:
+            ambigus.add(cle_affichage)
+        else:
+            lookup[cle_affichage] = p["key"]
+    for cle in ambigus:
+        lookup.pop(cle, None)
+    return lookup
+
+
+def charger_deja_rotes(jour_actuel, lookup_affichage):
+    """Personnes ayant déjà eu un créneau Déambule ou tardif un autre jour,
+    d'après les fichiers output/planning_<Jour>.xlsx déjà générés."""
+    deja = set()
+    for autre_jour in JOURS_VALIDES:
+        if autre_jour == jour_actuel.lower():
+            continue
+        nom_jour = autre_jour.capitalize()
+        chemin = OUTPUT_DIR / f"planning_{nom_jour}.xlsx"
+        if not chemin.exists():
+            continue
+        wb = load_workbook(chemin, data_only=True)
+        if nom_jour not in wb.sheetnames:
+            continue
+        for row in wb[nom_jour].iter_rows(min_row=2, values_only=True):
+            if not row or row[0] is None or str(row[0]).startswith("("):
+                continue
+            tache, debut, _fin, _requis, _affectes, _manquant, personnes = row[:7]
+            if not personnes:
+                continue
+            if not est_deambule_ou_tardif(str(tache).strip().lower(), to_minutes(debut)):
+                continue
+            for nom in str(personnes).split(","):
+                nom_normalise = nom.strip()
+                for marqueur in (" (**)", " (*)"):
+                    nom_normalise = nom_normalise.replace(marqueur, "")
+                cle = lookup_affichage.get(nom_normalise.strip().lower())
+                if cle:
+                    deja.add(cle)
+    return deja
 
 
 # ---------------------------------------------------------------------------
@@ -243,15 +318,23 @@ def load_data(jour):
         nom = str(row["Nom"]).strip()
         prenom = str(row["Prénom"]).strip()
         fonction = str(row.get("Fonction", "")).strip()
-        capacites = parse_capacites(row.get("Capacités"))
+        raw_caps = parse_capacites(row.get("Capacités"))
+        # capacites_explicites : uniquement les tâches nommées directement (pas
+        # via wildcard "* - X"). Seules ces personnes peuvent être assignées
+        # aux tâches spécifiques (colonne B de l'onglet Tâches).
+        if raw_caps is None or isinstance(raw_caps, tuple):
+            capacites_explicites = None
+        else:
+            capacites_explicites = raw_caps
         people.append({
             "nom": nom,
             "prenom": prenom,
             "key": person_key(nom, prenom),
             "fonction": fonction.lower(),
             "max_shifts": MAX_SHIFTS_PAR_FONCTION.get(fonction.lower(), TARGET_SHIFTS_PER_DAY),
-            "capacites": capacites,
-            "auto_gere": capacites is not None and len(capacites) == 1,
+            "capacites": raw_caps,           # résolu plus bas si tuple "exclude"
+            "capacites_explicites": capacites_explicites,
+            "auto_gere": raw_caps is not None and not isinstance(raw_caps, tuple) and len(raw_caps) == 1,
         })
 
     # Nom d'affichage : le prénom seul pour gagner de la place ; complété de
@@ -285,7 +368,7 @@ def load_data(jour):
                 f"blocages.xlsx : personne inconnue '{prenom} {nom}' (absente de personnes.xlsx)"
             )
         # (priorité, colonne raison, colonne début, colonne fin)
-        for priorite, col_raison, col_debut, col_fin in ((1, 2, 3, 4), (2, 5, 6, 7)):
+        for priorite, col_raison, col_debut, col_fin in ((1, 2, 3, 4), (2, 5, 6, 7), (3, 8, 9, 10)):
             if pd.isna(row.iloc[col_debut]) or pd.isna(row.iloc[col_fin]):
                 continue
             debut = to_minutes(row.iloc[col_debut])
@@ -338,30 +421,65 @@ def load_data(jour):
             })
             fixed_assignments.append((key, s_idx))
 
-    return shifts, people, blocages_map, fixed_assignments
+    # Résolution des capacités "* - exclusions" : maintenant que toutes les
+    # tâches (plages + fixes) sont connues, on peut construire le set final.
+    all_taches_norm = {s["tache_norm"] for s in shifts}
+    for p in people:
+        if isinstance(p["capacites"], tuple):
+            _, exclusions = p["capacites"]
+            resolved = all_taches_norm - exclusions
+            p["capacites"] = resolved if resolved else None
+            p["auto_gere"] = p["capacites"] is not None and len(p["capacites"]) == 1
+
+    # Tâches spécifiques (colonne B de l'onglet Tâches dans plages_horaires.xlsx) :
+    # seules les personnes qui ont explicitement déclaré cette tâche dans leurs
+    # capacités peuvent s'y voir assignées (pas le pool général).
+    taches_specifiques = set()
+    xl_sheets = pd.ExcelFile(DATA_DIR / "plages_horaires.xlsx").sheet_names
+    if "Tâches" in xl_sheets:
+        taches_df = pd.read_excel(DATA_DIR / "plages_horaires.xlsx", sheet_name="Tâches", header=0)
+        if taches_df.shape[1] > 1:
+            col_b = taches_df.iloc[:, 1]
+            taches_specifiques = {str(v).strip().lower() for v in col_b if pd.notna(v) and str(v).strip()}
+
+    deja_rotes = charger_deja_rotes(jour, construire_lookup_affichage(people))
+
+    return shifts, people, blocages_map, fixed_assignments, deja_rotes, taches_specifiques
 
 
 # ---------------------------------------------------------------------------
 # Construction et résolution du modèle
 # ---------------------------------------------------------------------------
 
-def build_model(shifts, people, blocages_map, fixed_assignments):
+def build_model(shifts, people, blocages_map, fixed_assignments, deja_rotes, taches_specifiques=None):
     model = cp_model.CpModel()
+    taches_specifiques = taches_specifiques or set()
 
     key_to_idx = {p["key"]: idx for idx, p in enumerate(people)}
     fixed_pairs = {(key_to_idx[key], s_idx) for key, s_idx in fixed_assignments}
 
     x = {}          # (p_idx, s_idx) -> BoolVar, uniquement pour les paires possibles
     p1_pairs = set()  # paires en conflit avec un blocage de priorité 1
-    p2_pairs = set()  # paires en conflit avec une préférence (priorité 2)
+    p2_pairs = set()  # paires en conflit avec une préférence de priorité 2
+    p3_pairs = set()  # paires en conflit avec une préférence de priorité 3
 
     for s_idx, s in enumerate(shifts):
         for p_idx, p in enumerate(people):
             is_fixed = (p_idx, s_idx) in fixed_pairs
 
-            caps = p["capacites"]
-            if not is_fixed and caps is not None and s["tache_norm"] not in caps:
-                continue
+            if not is_fixed:
+                if s["tache_norm"] in taches_specifiques:
+                    # Tâche spécifique : uniquement les personnes qui l'ont
+                    # déclarée explicitement dans leurs capacités (pas le pool
+                    # général "Tous" ni les wildcards "* - X").
+                    caps_expl = p["capacites_explicites"]
+                    if caps_expl is None or s["tache_norm"] not in caps_expl:
+                        continue
+                else:
+                    # Tâche commune : vérification habituelle par capacités.
+                    caps = p["capacites"]
+                    if caps is not None and s["tache_norm"] not in caps:
+                        continue
 
             # Une seule capacité déclarée : la personne s'auto-gère sur cette
             # tâche et n'est jamais insérée dans le planning par le solveur.
@@ -385,6 +503,12 @@ def build_model(shifts, people, blocages_map, fixed_assignments):
                 for b in blocks
             ):
                 p2_pairs.add((p_idx, s_idx))
+
+            if any(
+                b["priorite"] == 3 and overlaps(s["debut"], s["fin"], b["debut"], b["fin"])
+                for b in blocks
+            ):
+                p3_pairs.add((p_idx, s_idx))
 
     # Les shifts fixes sont garantis
     for pair in fixed_pairs:
@@ -431,7 +555,26 @@ def build_model(shifts, people, blocages_map, fixed_assignments):
     model.add_max_equality(max_total, totals)
     model.add_min_equality(min_total, totals)
 
-    return model, x, shortfall, p1_pairs, p2_pairs, max_total, min_total
+    # Rotation Déambule/tardif : pour chaque personne concernée qui n'est
+    # pas déjà passée par un tel créneau un autre jour, un indicateur vaut 1
+    # si elle n'en a aucun aujourd'hui non plus (à minimiser), 0 sinon. Les
+    # Junior.e, COF et personnes auto-gérées ne sont jamais concernés.
+    deambule_tardif = {
+        s_idx for s_idx, s in enumerate(shifts)
+        if est_deambule_ou_tardif(s["tache_norm"], s["debut"])
+    }
+    manque_rotation = []  # liste de (p_idx, indicateur BoolVar)
+    for p_idx, p in enumerate(people):
+        if p["key"] in deja_rotes or p["fonction"] in ("junior.e", "cof") or p["auto_gere"]:
+            continue
+        creneaux_rotation = [x[(p_idx, s_idx)] for s_idx in deambule_tardif if (p_idx, s_idx) in x]
+        if not creneaux_rotation:
+            continue
+        indicateur = model.new_bool_var(f"manque_rotation_{p_idx}")
+        model.add(sum(creneaux_rotation) + indicateur >= 1)
+        manque_rotation.append((p_idx, indicateur))
+
+    return model, x, shortfall, p1_pairs, p2_pairs, p3_pairs, max_total, min_total, manque_rotation
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +601,7 @@ def trouver_raison(blocages_map, key, s, priorite):
     return ""
 
 
-def export_results(jour, shifts, people, x, shortfall, p1_pairs, p2_pairs, blocages_map, solver, output_path):
+def export_results(jour, shifts, people, x, shortfall, p1_pairs, p2_pairs, p3_pairs, blocages_map, manque_rotation, solver, output_path):
     wb = Workbook()
     wb.remove(wb.active)
 
@@ -477,6 +620,8 @@ def export_results(jour, shifts, people, x, shortfall, p1_pairs, p2_pairs, bloca
                     name += " (**)"
                 if (p_idx, s_idx) in p2_pairs:
                     name += " (*)"
+                if (p_idx, s_idx) in p3_pairs:
+                    name += " (***)"
                 assigned_names.append(name)
 
         manquant = solver.value(shortfall[s_idx])
@@ -497,8 +642,10 @@ def export_results(jour, shifts, people, x, shortfall, p1_pairs, p2_pairs, bloca
     ws.append([])
     note1 = ws.cell(row=ws.max_row + 1, column=1, value="(**) Personne affectée malgré un blocage de priorité 1")
     note1.font = Font(italic=True, size=9)
-    note = ws.cell(row=ws.max_row + 1, column=1, value="(*) Personne affectée malgré une préférence de blocage (priorité 2)")
-    note.font = Font(italic=True, size=9)
+    note2 = ws.cell(row=ws.max_row + 1, column=1, value="(*) Personne affectée malgré une préférence de blocage (priorité 2)")
+    note2.font = Font(italic=True, size=9)
+    note3 = ws.cell(row=ws.max_row + 1, column=1, value="(***) Personne affectée malgré une préférence de blocage (priorité 3)")
+    note3.font = Font(italic=True, size=9)
 
     for col, width in enumerate([20, 8, 8, 8, 10, 10, 70], start=1):
         ws.column_dimensions[get_column_letter(col)].width = width
@@ -524,6 +671,8 @@ def export_results(jour, shifts, people, x, shortfall, p1_pairs, p2_pairs, bloca
                 part += " (**)"
             if (p_idx, s_idx) in p2_pairs:
                 part += " (*)"
+            if (p_idx, s_idx) in p3_pairs:
+                part += " (***)"
             detail_parts.append(part)
         ws.append([p["nom_affichage"], len(assigned), "; ".join(detail_parts)])
 
@@ -571,10 +720,50 @@ def export_results(jour, shifts, people, x, shortfall, p1_pairs, p2_pairs, bloca
             if raison:
                 detail += f" ({raison})"
             ws.append([
-                "Préférence non respectée",
+                "Préférence non respectée (priorité 2)",
                 s["tache"],
                 f"{minutes_to_str(s['debut'])}-{minutes_to_str(s['fin'])}",
                 detail,
+            ])
+
+    for (p_idx, s_idx) in p3_pairs:
+        if solver.value(x[(p_idx, s_idx)]) == 1:
+            s = shifts[s_idx]
+            p = people[p_idx]
+            raison = trouver_raison(blocages_map, p["key"], s, priorite=3)
+            detail = f"{p['nom_affichage']} avait indiqué une préférence (priorité 3) sur ce créneau"
+            if raison:
+                detail += f" ({raison})"
+            ws.append([
+                "Préférence non respectée (priorité 3)",
+                s["tache"],
+                f"{minutes_to_str(s['debut'])}-{minutes_to_str(s['fin'])}",
+                detail,
+            ])
+
+    for (p_idx, indicateur) in manque_rotation:
+        if solver.value(indicateur) == 1:
+            p = people[p_idx]
+            ws.append([
+                "Rotation Déambule/tardif manquante",
+                "-",
+                "-",
+                f"{p['nom_affichage']} n'a encore eu aucun créneau Déambule ou tardif cette semaine",
+            ])
+
+    for p_idx, p in enumerate(people):
+        if p["auto_gere"] or p["max_shifts"] < 2:
+            continue
+        nb_shifts = sum(
+            1 for s_idx in range(len(shifts))
+            if (p_idx, s_idx) in x and solver.value(x[(p_idx, s_idx)]) == 1
+        )
+        if 0 < nb_shifts < p["max_shifts"]:
+            ws.append([
+                "Shifts incomplets",
+                "-",
+                "-",
+                f"{p['nom_affichage']} n'a fait que {nb_shifts} shift(s) sur {p['max_shifts']} attendus",
             ])
 
     if ws.max_row == 1:
@@ -599,14 +788,14 @@ def generer_planning(jour):
     interceptées : à l'appelant de les afficher comme il convient."""
     messages = []
 
-    shifts, people, blocages_map, fixed_assignments = load_data(jour)
+    shifts, people, blocages_map, fixed_assignments, deja_rotes, taches_specifiques = load_data(jour)
     messages.append(
         f"{jour} : {len(shifts)} créneaux à couvrir, {len(people)} personnes dans l'équipe, "
         f"{len(fixed_assignments)} shift(s) fixe(s)."
     )
 
-    model, x, shortfall, p1_pairs, p2_pairs, max_total, min_total = build_model(
-        shifts, people, blocages_map, fixed_assignments
+    model, x, shortfall, p1_pairs, p2_pairs, p3_pairs, max_total, min_total, manque_rotation = build_model(
+        shifts, people, blocages_map, fixed_assignments, deja_rotes, taches_specifiques
     )
 
     solver = cp_model.CpSolver()
@@ -629,29 +818,57 @@ def generer_planning(jour):
         return {"success": False, "messages": messages, "output_path": None}
 
     shortfall_min = sum(solver.value(v) for v in shortfall.values())
-
-    # Phase 2 : à couverture égale, respecter au maximum les blocages priorité 1.
-    p1_penalty = sum(x[pair] for pair in p1_pairs) if p1_pairs else 0
     model.add(total_shortfall_expr <= shortfall_min)
+
+    # Phase 2 : à couverture égale, respecter au maximum les blocages de priorité 1.
+    p1_penalty = sum(x[pair] for pair in p1_pairs) if p1_pairs else 0
     model.minimize(p1_penalty)
     solver.solve(model)
     p1_violations_min = sum(solver.value(x[pair]) for pair in p1_pairs) if p1_pairs else 0
-
-    # Phase 3 : à couverture et respect priorité 1 égaux, optimiser préférences et équité.
-    p2_penalty = sum(x[pair] for pair in p2_pairs) if p2_pairs else 0
     model.add(p1_penalty <= p1_violations_min)
-    model.minimize(W_PRIORITY2 * p2_penalty + W_FAIRNESS * (max_total - min_total))
+
+    # Phase 3 : à priorité 1 respectée au mieux, idem pour la priorité 2.
+    p2_penalty = sum(x[pair] for pair in p2_pairs) if p2_pairs else 0
+    model.minimize(p2_penalty)
+    solver.solve(model)
+    p2_violations_min = sum(solver.value(x[pair]) for pair in p2_pairs) if p2_pairs else 0
+    model.add(p2_penalty <= p2_violations_min)
+
+    # Phase 4 : à priorité 2 respectée au mieux, idem pour la priorité 3.
+    p3_penalty = sum(x[pair] for pair in p3_pairs) if p3_pairs else 0
+    model.minimize(p3_penalty)
+    solver.solve(model)
+    p3_violations_min = sum(solver.value(x[pair]) for pair in p3_pairs) if p3_pairs else 0
+    model.add(p3_penalty <= p3_violations_min)
+
+    # Phase 5 : à blocages respectés au mieux, faire passer chacun par un
+    # créneau Déambule/tardif au moins une fois sur la semaine.
+    rotation_penalty = sum(ind for _, ind in manque_rotation) if manque_rotation else 0
+    model.minimize(rotation_penalty)
+    solver.solve(model)
+    rotation_min = sum(solver.value(ind) for _, ind in manque_rotation) if manque_rotation else 0
+    model.add(rotation_penalty <= rotation_min)
+
+    # Phase 6 : enfin, répartir la charge équitablement entre les personnes.
+    model.minimize(max_total - min_total)
     solver.solve(model)
 
     total_shortfall = sum(solver.value(v) for v in shortfall.values())
     total_p1 = sum(solver.value(x[pair]) for pair in p1_pairs) if p1_pairs else 0
-    total_p2 = sum(solver.value(x[pair]) for pair in p2_pairs)
+    total_p2 = sum(solver.value(x[pair]) for pair in p2_pairs) if p2_pairs else 0
+    total_p3 = sum(solver.value(x[pair]) for pair in p3_pairs) if p3_pairs else 0
+    total_manque_rotation = sum(solver.value(ind) for _, ind in manque_rotation) if manque_rotation else 0
     messages.append(f"Créneaux non couverts (somme) : {total_shortfall}")
     messages.append(f"Blocages priorité 1 non respectés : {total_p1}")
     messages.append(f"Préférences (priorité 2) non respectées : {total_p2}")
+    messages.append(f"Préférences (priorité 3) non respectées : {total_p3}")
+    messages.append(f"Personnes sans créneau Déambule/tardif cette semaine : {total_manque_rotation}")
 
     output_path = OUTPUT_DIR / f"planning_{jour}.xlsx"
-    export_results(jour, shifts, people, x, shortfall, p1_pairs, p2_pairs, blocages_map, solver, output_path)
+    export_results(
+        jour, shifts, people, x, shortfall, p1_pairs, p2_pairs, p3_pairs,
+        blocages_map, manque_rotation, solver, output_path,
+    )
     messages.append(f"Planning généré : {output_path}")
 
     return {
@@ -661,6 +878,7 @@ def generer_planning(jour):
         "total_shortfall": total_shortfall,
         "total_p1": total_p1,
         "total_p2": total_p2,
+        "total_p3": total_p3,
     }
 
 

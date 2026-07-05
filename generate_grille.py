@@ -285,6 +285,37 @@ def configurer_impression(ws):
     ws.print_options.horizontalCentered = True
 
 
+# Disposition personnalisée des lignes, du haut vers le bas, regroupées en
+# sections séparées par un bandeau d'heures répété (lisibilité sur une
+# feuille haute). "tache_prefixe" développe toutes les tâches dont le nom
+# commence par ce préfixe, dans leur ordre d'apparition dans le planning.
+DISPOSITION = [
+    [("scene", "La Ruche"), ("tache", "Abeilles Ruche"), ("tache", "Entrée backstage")],
+    [("tache", "Ailes"), ("tache", "Bar public"), ("tache", "Bar loges")],
+    [("scene", "Grande Scène"), ("scene", "Véga"), ("scene", "Belleville"), ("scene", "Dôme"), ("scene", "Club Tent")],
+    [("tache_prefixe", "tech"), ("tache_prefixe", "déambule")],
+]
+
+
+def resoudre_section(section, scenes, taches, deja_places):
+    """Développe une section de DISPOSITION en une liste de (type, nom) à
+    dessiner, en ignorant ce qui ne correspond à rien et en notant ce qui a
+    été placé (pour le rattrapage des scènes/tâches non listées)."""
+    elements = []
+    for type_, valeur in section:
+        if type_ == "scene":
+            noms = [s for s in scenes if s.lower() == valeur.lower()]
+        elif type_ == "tache":
+            noms = [t for t in taches if t.lower() == valeur.lower()]
+        else:  # tache_prefixe
+            type_ = "tache"
+            noms = [t for t in taches if t.lower().startswith(valeur.lower())]
+        for nom in noms:
+            elements.append((type_, nom))
+            deja_places.add((type_, nom.lower()))
+    return elements
+
+
 def construire_grille(output_path):
     scenes, concerts = charger_horaires_concerts(DATA_DIR / "horaires_paleo.xlsx")
     dates_par_jour = construire_dates_par_jour(concerts)
@@ -310,29 +341,48 @@ def construire_grille(output_path):
         titre_cell.fill = FOND_LABEL
         ws.row_dimensions[1].height = 20
 
-        ecrire_entete_heures(ws, 2)
+        taches = charger_taches_planning(planning_path, jour)
+        deja_places = set()
 
-        ligne = 3
-        for scene in scenes:
-            lanes = assigner_lanes(concerts.get((scene, date), []))
-            hauteur = hauteur_pour_lanes(26, len(lanes))
-            for i, lane in enumerate(lanes):
-                ecrire_ligne(ws, ligne, scene if i == 0 else "", lane, FOND_CONCERT, TEXTE_CONCERT, hauteur=hauteur)
-                ligne += 1
-
-        ligne += 1
-        ws.cell(row=ligne, column=1, value="Plannings").font = Font(bold=True, color="000000", size=8)
-        ws.cell(row=ligne, column=1).fill = FOND_ENTETE
+        ligne = 2
         ecrire_entete_heures(ws, ligne)
         ligne += 1
+        for section in DISPOSITION:
+            for type_, nom in resoudre_section(section, scenes, taches, deja_places):
+                if type_ == "scene":
+                    lanes = assigner_lanes(concerts.get((nom, date), []))
+                    hauteur = hauteur_pour_lanes(26, len(lanes))
+                    fond, texte = FOND_CONCERT, TEXTE_CONCERT
+                else:
+                    lanes = assigner_lanes(taches.get(nom, []))
+                    hauteur = hauteur_pour_lanes(20, len(lanes))
+                    fond, texte = FOND_PLANNING, TEXTE_PLANNING
+                for i, lane in enumerate(lanes):
+                    ecrire_ligne(ws, ligne, nom if i == 0 else "", lane, fond, texte, hauteur=hauteur)
+                    ligne += 1
+            ecrire_entete_heures(ws, ligne)
+            ligne += 1
 
-        taches = charger_taches_planning(planning_path, jour)
-        for tache, evenements in taches.items():
-            lanes = assigner_lanes(evenements)
-            hauteur = hauteur_pour_lanes(20, len(lanes))
+        restantes = [
+            (type_, nom) for type_, nom in
+            ([("scene", s) for s in scenes] + [("tache", t) for t in taches])
+            if (type_, nom.lower()) not in deja_places
+        ]
+        for type_, nom in restantes:
+            if type_ == "scene":
+                lanes = assigner_lanes(concerts.get((nom, date), []))
+                hauteur = hauteur_pour_lanes(26, len(lanes))
+                fond, texte = FOND_CONCERT, TEXTE_CONCERT
+            else:
+                lanes = assigner_lanes(taches.get(nom, []))
+                hauteur = hauteur_pour_lanes(20, len(lanes))
+                fond, texte = FOND_PLANNING, TEXTE_PLANNING
             for i, lane in enumerate(lanes):
-                ecrire_ligne(ws, ligne, tache if i == 0 else "", lane, FOND_PLANNING, TEXTE_PLANNING, hauteur=hauteur)
+                ecrire_ligne(ws, ligne, nom if i == 0 else "", lane, fond, texte, hauteur=hauteur)
                 ligne += 1
+        if restantes:
+            ecrire_entete_heures(ws, ligne)
+            ligne += 1
 
         ajuster_largeurs_colonnes(ws)
         configurer_impression(ws)
