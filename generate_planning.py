@@ -101,7 +101,12 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-BASE_DIR = Path(__file__).resolve().parent
+import sys as _sys
+if getattr(_sys, "frozen", False):
+    # Exécutable PyInstaller : les données sont à côté du .exe
+    BASE_DIR = Path(_sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 OUTPUT_DIR = BASE_DIR / "output"
 
@@ -267,7 +272,7 @@ def charger_deja_rotes(jour_actuel, lookup_affichage):
                 continue
             for nom in str(personnes).split(","):
                 nom_normalise = nom.strip()
-                for marqueur in (" (**)", " (*)"):
+                for marqueur in (" (*)", " (**)", " (***)"):
                     nom_normalise = nom_normalise.replace(marqueur, "")
                 cle = lookup_affichage.get(nom_normalise.strip().lower())
                 if cle:
@@ -318,6 +323,11 @@ def load_data(jour):
         nom = str(row["Nom"]).strip()
         prenom = str(row["Prénom"]).strip()
         fonction = str(row.get("Fonction", "")).strip()
+        nb_shifts_col = row.get("Nombre de shifts")
+        if nb_shifts_col is not None and not (isinstance(nb_shifts_col, float) and pd.isna(nb_shifts_col)):
+            max_shifts_p = int(nb_shifts_col)
+        else:
+            max_shifts_p = MAX_SHIFTS_PAR_FONCTION.get(fonction.lower(), TARGET_SHIFTS_PER_DAY)
         raw_caps = parse_capacites(row.get("Capacités"))
         # capacites_explicites : uniquement les tâches nommées directement (pas
         # via wildcard "* - X"). Seules ces personnes peuvent être assignées
@@ -326,15 +336,23 @@ def load_data(jour):
             capacites_explicites = None
         else:
             capacites_explicites = raw_caps
+        # Disponibilité pour ce jour : col F-K (Mardi-Dimanche). 0 = absent.
+        dispo_val = row.get(jour)
+        disponible = not (
+            dispo_val is not None
+            and not (isinstance(dispo_val, float) and pd.isna(dispo_val))
+            and str(dispo_val).strip() == "0"
+        )
         people.append({
             "nom": nom,
             "prenom": prenom,
             "key": person_key(nom, prenom),
             "fonction": fonction.lower(),
-            "max_shifts": MAX_SHIFTS_PAR_FONCTION.get(fonction.lower(), TARGET_SHIFTS_PER_DAY),
+            "max_shifts": max_shifts_p,
             "capacites": raw_caps,           # résolu plus bas si tuple "exclude"
             "capacites_explicites": capacites_explicites,
             "auto_gere": raw_caps is not None and not isinstance(raw_caps, tuple) and len(raw_caps) == 1,
+            "disponible": disponible,
         })
 
     # Nom d'affichage : le prénom seul pour gagner de la place ; complété de
@@ -481,6 +499,10 @@ def build_model(shifts, people, blocages_map, fixed_assignments, deja_rotes, tac
                     if caps is not None and s["tache_norm"] not in caps:
                         continue
 
+            # Personne absente ce jour-là (colonne F-K dans personnes.xlsx = 0).
+            if not is_fixed and not p["disponible"]:
+                continue
+
             # Une seule capacité déclarée : la personne s'auto-gère sur cette
             # tâche et n'est jamais insérée dans le planning par le solveur.
             if not is_fixed and p["auto_gere"]:
@@ -537,6 +559,16 @@ def build_model(shifts, people, blocages_map, fixed_assignments, deja_rotes, tac
                     if (p_idx, i) in x and (p_idx, j) in x:
                         model.add(x[(p_idx, i)] + x[(p_idx, j)] <= 1)
 
+    # Une personne ne fait pas deux fois la même tâche dans la journée.
+    shifts_par_tache = defaultdict(list)
+    for s_idx, s in enumerate(shifts):
+        shifts_par_tache[s["tache_norm"]].append(s_idx)
+    for p_idx in range(len(people)):
+        for s_idxs in shifts_par_tache.values():
+            vars_tache = [x[(p_idx, s_idx)] for s_idx in s_idxs if (p_idx, s_idx) in x]
+            if len(vars_tache) > 1:
+                model.add(sum(vars_tache) <= 1)
+
     for p_idx, p in enumerate(people):
         today = [x[(p_idx, s_idx)] for s_idx in range(len(shifts)) if (p_idx, s_idx) in x]
         if today:
@@ -554,6 +586,13 @@ def build_model(shifts, people, blocages_map, fixed_assignments, deja_rotes, tac
     min_total = model.new_int_var(0, len(shifts), "min_total")
     model.add_max_equality(max_total, totals)
     model.add_min_equality(min_total, totals)
+
+    # Déambule à éviter pour les personnes limitées à 1 shift : elles ont peu
+    # de créneaux disponibles et un Déambule est moins utile qu'une tâche fixe.
+    deambule_un_shift_pairs = {
+        (p_idx, s_idx) for (p_idx, s_idx) in x
+        if people[p_idx]["max_shifts"] == 1 and "déambule" in shifts[s_idx]["tache_norm"]
+    }
 
     # Rotation Déambule/tardif : pour chaque personne concernée qui n'est
     # pas déjà passée par un tel créneau un autre jour, un indicateur vaut 1
@@ -574,7 +613,7 @@ def build_model(shifts, people, blocages_map, fixed_assignments, deja_rotes, tac
         model.add(sum(creneaux_rotation) + indicateur >= 1)
         manque_rotation.append((p_idx, indicateur))
 
-    return model, x, shortfall, p1_pairs, p2_pairs, p3_pairs, max_total, min_total, manque_rotation
+    return model, x, shortfall, p1_pairs, p2_pairs, p3_pairs, max_total, min_total, manque_rotation, deambule_un_shift_pairs
 
 
 # ---------------------------------------------------------------------------
@@ -617,9 +656,9 @@ def export_results(jour, shifts, people, x, shortfall, p1_pairs, p2_pairs, p3_pa
             if (p_idx, s_idx) in x and solver.value(x[(p_idx, s_idx)]) == 1:
                 name = p["nom_affichage"]
                 if (p_idx, s_idx) in p1_pairs:
-                    name += " (**)"
-                if (p_idx, s_idx) in p2_pairs:
                     name += " (*)"
+                if (p_idx, s_idx) in p2_pairs:
+                    name += " (**)"
                 if (p_idx, s_idx) in p3_pairs:
                     name += " (***)"
                 assigned_names.append(name)
@@ -640,11 +679,11 @@ def export_results(jour, shifts, people, x, shortfall, p1_pairs, p2_pairs, p3_pa
                 ws.cell(row=ws.max_row, column=col).fill = SHORTAGE_FILL
 
     ws.append([])
-    note1 = ws.cell(row=ws.max_row + 1, column=1, value="(**) Personne affectée malgré un blocage de priorité 1")
+    note1 = ws.cell(row=ws.max_row + 1, column=1, value="(*) Personne affectée malgré un blocage de priorité 1")
     note1.font = Font(italic=True, size=9)
-    note2 = ws.cell(row=ws.max_row + 1, column=1, value="(*) Personne affectée malgré une préférence de blocage (priorité 2)")
+    note2 = ws.cell(row=ws.max_row + 1, column=1, value="(**) Personne affectée malgré un blocage de priorité 2")
     note2.font = Font(italic=True, size=9)
-    note3 = ws.cell(row=ws.max_row + 1, column=1, value="(***) Personne affectée malgré une préférence de blocage (priorité 3)")
+    note3 = ws.cell(row=ws.max_row + 1, column=1, value="(***) Personne affectée malgré un blocage de priorité 3")
     note3.font = Font(italic=True, size=9)
 
     for col, width in enumerate([20, 8, 8, 8, 10, 10, 70], start=1):
@@ -668,9 +707,9 @@ def export_results(jour, shifts, people, x, shortfall, p1_pairs, p2_pairs, p3_pa
             s = shifts[s_idx]
             part = f"{s['tache']} {minutes_to_str(s['debut'])}-{minutes_to_str(s['fin'])}"
             if (p_idx, s_idx) in p1_pairs:
-                part += " (**)"
-            if (p_idx, s_idx) in p2_pairs:
                 part += " (*)"
+            if (p_idx, s_idx) in p2_pairs:
+                part += " (**)"
             if (p_idx, s_idx) in p3_pairs:
                 part += " (***)"
             detail_parts.append(part)
@@ -794,7 +833,7 @@ def generer_planning(jour):
         f"{len(fixed_assignments)} shift(s) fixe(s)."
     )
 
-    model, x, shortfall, p1_pairs, p2_pairs, p3_pairs, max_total, min_total, manque_rotation = build_model(
+    model, x, shortfall, p1_pairs, p2_pairs, p3_pairs, max_total, min_total, manque_rotation, deambule_un_shift_pairs = build_model(
         shifts, people, blocages_map, fixed_assignments, deja_rotes, taches_specifiques
     )
 
@@ -841,7 +880,14 @@ def generer_planning(jour):
     p3_violations_min = sum(solver.value(x[pair]) for pair in p3_pairs) if p3_pairs else 0
     model.add(p3_penalty <= p3_violations_min)
 
-    # Phase 5 : à blocages respectés au mieux, faire passer chacun par un
+    # Phase 5 : éviter d'assigner un Déambule aux personnes limitées à 1 shift.
+    d1_penalty = sum(x[pair] for pair in deambule_un_shift_pairs) if deambule_un_shift_pairs else 0
+    model.minimize(d1_penalty)
+    solver.solve(model)
+    d1_min = sum(solver.value(x[pair]) for pair in deambule_un_shift_pairs) if deambule_un_shift_pairs else 0
+    model.add(d1_penalty <= d1_min)
+
+    # Phase 6 : à blocages respectés au mieux, faire passer chacun par un
     # créneau Déambule/tardif au moins une fois sur la semaine.
     rotation_penalty = sum(ind for _, ind in manque_rotation) if manque_rotation else 0
     model.minimize(rotation_penalty)
@@ -849,7 +895,7 @@ def generer_planning(jour):
     rotation_min = sum(solver.value(ind) for _, ind in manque_rotation) if manque_rotation else 0
     model.add(rotation_penalty <= rotation_min)
 
-    # Phase 6 : enfin, répartir la charge équitablement entre les personnes.
+    # Phase 7 : enfin, répartir la charge équitablement entre les personnes.
     model.minimize(max_total - min_total)
     solver.solve(model)
 

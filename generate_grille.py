@@ -1,12 +1,12 @@
 """
-Génère une grille horaire visuelle (un onglet par jour) à partir :
+Génère une grille horaire visuelle par jour à partir :
   - de data/horaires_paleo.xlsx     : les horaires des concerts, par scène
   - de output/planning_<Jour>.xlsx  : les plannings d'équipe déjà générés
     par generate_planning.py (un par jour)
 
 Pour chaque jour disponible (présent à la fois dans horaires_paleo.xlsx et
-sous forme de output/planning_<Jour>.xlsx déjà généré), produit un onglet
-avec :
+sous forme de output/planning_<Jour>.xlsx déjà généré), produit un fichier
+Excel séparé output/Grille_<Jour>.xlsx contenant un onglet avec :
   - une ligne de bandeau horaire (de 15h à 03h, par pas de 5 minutes) ;
   - une ligne par scène, avec le nom de chaque concert positionné et
     dimensionné selon son horaire réel ;
@@ -18,7 +18,7 @@ manquant) sont ignorés, avec un avertissement.
 
 Utilisation :
     python generate_grille.py
-    -> écrit output/Grille_horaire.xlsx
+    -> écrit output/Grille_<Jour>.xlsx pour chaque jour disponible
 """
 
 import datetime as dt
@@ -29,7 +29,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.worksheet.page import PageMargins
 
-from generate_planning import DATA_DIR, JOURS_VALIDES, OUTPUT_DIR, to_minutes
+from generate_planning import DATA_DIR, JOURS_VALIDES, OUTPUT_DIR, to_minutes, demander_jour
 
 JOURS_FR = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
 MOIS_FR = [
@@ -174,7 +174,10 @@ def charger_taches_planning(planning_path, jour):
         if not personnes:
             continue
         debut_min, fin_min = plage_minutes(debut, fin)
-        taches[str(tache).strip()].append((str(personnes).strip(), debut_min, fin_min))
+        noms = str(personnes).strip()
+        for marqueur in (" (*)", " (**)", " (***)"):
+            noms = noms.replace(marqueur, "")
+        taches[str(tache).strip()].append((noms, debut_min, fin_min))
 
     return taches
 
@@ -316,59 +319,26 @@ def resoudre_section(section, scenes, taches, deja_places):
     return elements
 
 
-def construire_grille(output_path):
-    scenes, concerts = charger_horaires_concerts(DATA_DIR / "horaires_paleo.xlsx")
-    dates_par_jour = construire_dates_par_jour(concerts)
-
+def construire_grille_jour(jour, date, scenes, concerts, taches):
+    """Construit et renvoie un classeur Excel contenant la grille pour un seul jour."""
     wb = Workbook()
     wb.remove(wb.active)
 
-    for jour in JOURS_FR:
-        if jour.lower() not in JOURS_VALIDES or jour not in dates_par_jour:
-            continue
+    titre = f"{jour} {date.day} {MOIS_FR[date.month - 1]} {date.year}"
+    ws = wb.create_sheet(title=titre[:31])
 
-        planning_path = OUTPUT_DIR / f"planning_{jour}.xlsx"
-        if not planning_path.exists():
-            print(f"Attention : {planning_path.name} introuvable, jour {jour} ignoré.")
-            continue
+    titre_cell = ws.cell(row=1, column=1, value=titre)
+    titre_cell.font = Font(bold=True, size=14, color="000000")
+    titre_cell.fill = FOND_LABEL
+    ws.row_dimensions[1].height = 20
 
-        date = dates_par_jour[jour]
-        titre = f"{jour} {date.day} {MOIS_FR[date.month - 1]} {date.year}"
-        ws = wb.create_sheet(title=titre[:31])
+    deja_places = set()
 
-        titre_cell = ws.cell(row=1, column=1, value=titre)
-        titre_cell.font = Font(bold=True, size=14, color="000000")
-        titre_cell.fill = FOND_LABEL
-        ws.row_dimensions[1].height = 20
-
-        taches = charger_taches_planning(planning_path, jour)
-        deja_places = set()
-
-        ligne = 2
-        ecrire_entete_heures(ws, ligne)
-        ligne += 1
-        for section in DISPOSITION:
-            for type_, nom in resoudre_section(section, scenes, taches, deja_places):
-                if type_ == "scene":
-                    lanes = assigner_lanes(concerts.get((nom, date), []))
-                    hauteur = hauteur_pour_lanes(26, len(lanes))
-                    fond, texte = FOND_CONCERT, TEXTE_CONCERT
-                else:
-                    lanes = assigner_lanes(taches.get(nom, []))
-                    hauteur = hauteur_pour_lanes(20, len(lanes))
-                    fond, texte = FOND_PLANNING, TEXTE_PLANNING
-                for i, lane in enumerate(lanes):
-                    ecrire_ligne(ws, ligne, nom if i == 0 else "", lane, fond, texte, hauteur=hauteur)
-                    ligne += 1
-            ecrire_entete_heures(ws, ligne)
-            ligne += 1
-
-        restantes = [
-            (type_, nom) for type_, nom in
-            ([("scene", s) for s in scenes] + [("tache", t) for t in taches])
-            if (type_, nom.lower()) not in deja_places
-        ]
-        for type_, nom in restantes:
+    ligne = 2
+    ecrire_entete_heures(ws, ligne)
+    ligne += 1
+    for section in DISPOSITION:
+        for type_, nom in resoudre_section(section, scenes, taches, deja_places):
             if type_ == "scene":
                 lanes = assigner_lanes(concerts.get((nom, date), []))
                 hauteur = hauteur_pour_lanes(26, len(lanes))
@@ -380,30 +350,92 @@ def construire_grille(output_path):
             for i, lane in enumerate(lanes):
                 ecrire_ligne(ws, ligne, nom if i == 0 else "", lane, fond, texte, hauteur=hauteur)
                 ligne += 1
-        if restantes:
-            ecrire_entete_heures(ws, ligne)
+        ecrire_entete_heures(ws, ligne)
+        ligne += 1
+
+    restantes = [
+        (type_, nom) for type_, nom in
+        ([("scene", s) for s in scenes] + [("tache", t) for t in taches])
+        if (type_, nom.lower()) not in deja_places
+    ]
+    for type_, nom in restantes:
+        if type_ == "scene":
+            lanes = assigner_lanes(concerts.get((nom, date), []))
+            hauteur = hauteur_pour_lanes(26, len(lanes))
+            fond, texte = FOND_CONCERT, TEXTE_CONCERT
+        else:
+            lanes = assigner_lanes(taches.get(nom, []))
+            hauteur = hauteur_pour_lanes(20, len(lanes))
+            fond, texte = FOND_PLANNING, TEXTE_PLANNING
+        for i, lane in enumerate(lanes):
+            ecrire_ligne(ws, ligne, nom if i == 0 else "", lane, fond, texte, hauteur=hauteur)
             ligne += 1
+    if restantes:
+        ecrire_entete_heures(ws, ligne)
 
-        ajuster_largeurs_colonnes(ws)
-        configurer_impression(ws)
-        ws.freeze_panes = "C3"
+    ajuster_largeurs_colonnes(ws)
+    configurer_impression(ws)
+    ws.freeze_panes = "C3"
 
-    if not wb.sheetnames:
+    return wb
+
+
+def construire_grilles():
+    """Génère un fichier Grille_<Jour>.xlsx par jour disponible."""
+    scenes, concerts = charger_horaires_concerts(DATA_DIR / "horaires_paleo.xlsx")
+    dates_par_jour = construire_dates_par_jour(concerts)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    chemins = []
+    for jour in JOURS_FR:
+        if jour.lower() not in JOURS_VALIDES or jour not in dates_par_jour:
+            continue
+        planning_path = OUTPUT_DIR / f"planning_{jour}.xlsx"
+        if not planning_path.exists():
+            print(f"Attention : {planning_path.name} introuvable, jour {jour} ignoré.")
+            continue
+        taches = charger_taches_planning(planning_path, jour)
+        wb = construire_grille_jour(jour, dates_par_jour[jour], scenes, concerts, taches)
+        output_path = OUTPUT_DIR / f"Grille_{jour}.xlsx"
+        wb.save(output_path)
+        chemins.append(output_path)
+
+    if not chemins:
         raise RuntimeError(
             "Aucun jour n'a pu être construit : vérifiez que des fichiers "
             "output/planning_<Jour>.xlsx existent pour au moins un jour présent "
             "dans data/horaires_paleo.xlsx."
         )
+    return chemins
 
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    wb.save(output_path)
-    return output_path
+
+def lister_jours_grille():
+    """Jours pour lesquels horaires_paleo.xlsx ET un planning généré existent."""
+    _, concerts = charger_horaires_concerts(DATA_DIR / "horaires_paleo.xlsx")
+    dates_par_jour = construire_dates_par_jour(concerts)
+    return [
+        jour for jour in JOURS_FR
+        if jour.lower() in JOURS_VALIDES
+        and jour in dates_par_jour
+        and (OUTPUT_DIR / f"planning_{jour}.xlsx").exists()
+    ]
 
 
 def main():
-    output_path = OUTPUT_DIR / "Grille_horaire.xlsx"
-    construire_grille(output_path)
-    print(f"Grille horaire générée : {output_path}")
+    jours = lister_jours_grille()
+    if not jours:
+        print("Aucun jour disponible : vérifiez que des fichiers output/planning_<Jour>.xlsx existent.")
+        return
+    jour = demander_jour(jours)
+
+    scenes, concerts = charger_horaires_concerts(DATA_DIR / "horaires_paleo.xlsx")
+    dates_par_jour = construire_dates_par_jour(concerts)
+    taches = charger_taches_planning(OUTPUT_DIR / f"planning_{jour}.xlsx", jour)
+    wb = construire_grille_jour(jour, dates_par_jour[jour], scenes, concerts, taches)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    output_path = OUTPUT_DIR / f"Grille_{jour}.xlsx"
+    wb.save(output_path)
+    print(f"Grille générée : {output_path}")
 
 
 if __name__ == "__main__":
